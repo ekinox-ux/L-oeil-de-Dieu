@@ -1,0 +1,161 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' https://fonts.googleapis.com 'unsafe-inline'; font-src https://fonts.gstatic.com; img-src 'self'; connect-src 'self' http://localhost:8500 http://127.0.0.1:8500">
+    <title>L'Oeil de Dieu - Statistiques</title>
+    <link rel="icon" type="image/svg+xml" href="favicon.svg">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&family=Oxanium:wght@400;500;600;700&family=Space+Grotesk:wght@400;500;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="css/style.css">
+    <!-- Chart.js 4.4.7 (MIT) embarque localement: fonctionne hors ligne. -->
+    <script src="vendor/chart.umd.min.js"
+            integrity="sha384-vsrfeLOOY6KuIYKDlmVH5UiBmgIdB1oEf7p01YgWHuqmOHfZr374+odEv96n9tNC"></script>
+</head>
+<body>
+
+    <div id="bg-layer" aria-hidden="true">
+        <div class="blob blob-1"></div>
+        <div class="blob blob-2"></div>
+        <div class="blob blob-3"></div>
+        <div class="blob blob-4"></div>
+        <div class="scanlines"></div>
+    </div>
+
+    <div id="cursor-glow" aria-hidden="true"></div>
+    <div id="scan-line" aria-hidden="true"></div>
+
+    <div id="app">
+        <header id="app-header" class="stats-header">
+            <div class="header-inner">
+                <a href="index.html" class="header-logo">L'OEIL DE DIEU</a>
+                <nav class="header-nav">
+                    <a href="index.html" class="nav-link">Recherche</a>
+                    <a href="stats.html" class="nav-link nav-active">Statistiques</a>
+                    <a href="maintenance.html" class="nav-link">Maintenance</a>
+                </nav>
+                <div class="header-status">
+                    <span class="pulse-dot"></span>
+                    <span id="stats-header-status">Connexion backend...</span>
+                </div>
+            </div>
+        </header>
+
+        <main class="stats-main">
+            <div class="stats-title-section">
+                <div class="page-kicker">INTELLIGENCE DASHBOARD</div>
+                <div class="stats-title-row">
+                    <h1 class="stats-page-title">Statistiques</h1>
+                    <select id="stats-index-select" class="stats-index-select">
+                        <option value="all">Tous les index</option>
+                    </select>
+                </div>
+                <div class="hero-status stats-status-row">
+                    <div class="status-chip">
+                        <span class="pulse-dot"></span>
+                        <span id="stats-system-status">Connexion backend...</span>
+                    </div>
+                    <span class="status-sep">/</span>
+                    <div class="status-chip">
+                        <span id="stats-index-status">Aucun index pret</span>
+                    </div>
+                </div>
+                <p class="stats-page-subtitle" id="stats-subtitle">Vue d'ensemble des donnees indexees</p>
+            </div>
+
+            <div class="kpi-grid">
+                <div class="kpi-card" style="animation-delay: 0s">
+                    <div class="kpi-accent"></div>
+                    <div class="kpi-value" data-target="0" data-format="number">0</div>
+                    <div class="kpi-label">Documents indexes</div>
+                </div>
+                <div class="kpi-card" style="animation-delay: 0.08s">
+                    <div class="kpi-accent"></div>
+                    <div class="kpi-value" data-target="0" data-format="number">0</div>
+                    <div class="kpi-label">Emails uniques</div>
+                </div>
+                <div class="kpi-card" style="animation-delay: 0.16s">
+                    <div class="kpi-accent"></div>
+                    <div class="kpi-value" data-target="0" data-format="number">0</div>
+                    <div class="kpi-label">Telephones uniques</div>
+                </div>
+                <div class="kpi-card" style="animation-delay: 0.24s">
+                    <div class="kpi-accent"></div>
+                    <div class="kpi-value" data-target="0" data-format="size">0</div>
+                    <div class="kpi-label">Taille de l'index</div>
+                </div>
+            </div>
+
+            <div class="charts-row">
+                <div class="chart-card chart-large" style="animation-delay: 0.3s">
+                    <div class="chart-card-header">
+                        <h3 class="chart-title">Top domaines email</h3>
+                        <span class="chart-badge" id="badge-domains">Top 10</span>
+                    </div>
+                    <div class="chart-body">
+                        <canvas id="chart-domains"></canvas>
+                    </div>
+                </div>
+                <div class="chart-card chart-small" style="animation-delay: 0.38s">
+                    <div class="chart-card-header">
+                        <h3 class="chart-title">Emails pro vs perso</h3>
+                    </div>
+                    <div class="chart-body chart-body-donut">
+                        <canvas id="chart-pro-perso"></canvas>
+                    </div>
+                </div>
+            </div>
+
+            <div class="charts-row">
+                <div class="chart-card chart-small" style="animation-delay: 0.46s">
+                    <div class="chart-card-header">
+                        <h3 class="chart-title">Extensions domaines</h3>
+                    </div>
+                    <div class="chart-body chart-body-donut">
+                        <canvas id="chart-tld"></canvas>
+                    </div>
+                </div>
+                <div class="chart-card chart-large" style="animation-delay: 0.54s">
+                    <div class="chart-card-header">
+                        <h3 class="chart-title">Prefixes telephone</h3>
+                        <span class="chart-badge">Mobile vs Fixe</span>
+                    </div>
+                    <div class="chart-body">
+                        <canvas id="chart-phones"></canvas>
+                    </div>
+                </div>
+            </div>
+
+            <div class="charts-row">
+                <div class="chart-card chart-full" style="animation-delay: 0.62s">
+                    <div class="chart-card-header">
+                        <h3 class="chart-title">Repartition par source</h3>
+                    </div>
+                    <div class="chart-body chart-body-auto">
+                        <div class="source-bars" id="source-bars"></div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="charts-row">
+                <div class="chart-card chart-full" style="animation-delay: 0.7s">
+                    <div class="chart-card-header">
+                        <h3 class="chart-title">Emails les plus frequents</h3>
+                        <span class="chart-badge">Top 20</span>
+                    </div>
+                    <div class="chart-body chart-body-auto">
+                        <div class="source-bars" id="top-emails-bars"></div>
+                    </div>
+                </div>
+            </div>
+        </main>
+    </div>
+
+    <script src="js/config.js?v=6"></script>
+    <script src="js/app-utils.js?v=6"></script>
+    <script src="js/effects.js?v=5"></script>
+    <script src="js/stats.js?v=5"></script>
+</body>
+</html>

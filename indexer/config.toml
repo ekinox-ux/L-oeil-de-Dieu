@@ -1,0 +1,13 @@
+writer_memory_mb = 256
+writer_threads = 1
+reader_threads = 2
+channel_size = 512
+max_word_length = 250
+max_doc_content_bytes = 2097152
+max_doc_input_bytes = 8388608
+sanitize_chars = ['{', '}', '[', ']', ':', '"', ',', '(', ')', '=', ';']
+index_raw_content = true
+language = "en"
+use_stemming = false
+use_stop_words = false
+commit_every_n_docs = 100_000

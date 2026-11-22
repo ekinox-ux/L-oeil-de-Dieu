@@ -1,0 +1,8 @@
+[
+  {
+    "id": "default",
+    "name": "Default",
+    "path": "${USERPROFILE}\\Documents\\index",
+    "source": "${USERPROFILE}\\Documents\\data"
+  }
+]

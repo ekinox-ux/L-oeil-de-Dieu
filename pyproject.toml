@@ -1,0 +1,11 @@
+[tool.pytest.ini_options]
+testpaths = ["backend/tests", "bot/tests"]
+tmp_path_retention_policy = "none"
+
+[tool.ruff]
+line-length = 130
+target-version = 'py314'
+
+[tool.ruff.lint]
+select = ['E', 'F']
+ignore = ['E501']

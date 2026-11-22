@@ -1,0 +1,42 @@
+# --- Environnements et caches ---
+venv/
+venv1/
+.venv/
+venv.broken-*/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.ruff_cache/
+.codex_pytest_tmp*/
+.codex_pytest_cache*/
+.codex_runtime_checks/
+pytest-cache-files-*/
+node_modules/
+
+# --- Fichiers temporaires et journaux ---
+*.log
+*.log.[0-9]*
+*.tmp
+
+# --- Secrets et configuration locale ---
+backend/.env
+bot/.env
+backend/indexes.local.json
+.claude/settings.local.json
+.claude/*.lock
+
+# --- Donnees produites par l'analyseur (contiennent des donnees personnelles) ---
+backend/analysis_*.json
+backend/progress_*.json
+backend/progress_*.json.migrated
+backend/progress_*.sqlite
+backend/progress_*.sqlite-wal
+backend/progress_*.sqlite-shm
+backend/progress_*.sqlite.corrupt*
+backend/analyzer_*.lock
+
+# --- Builds ---
+indexer/target/
+dist/
+build/

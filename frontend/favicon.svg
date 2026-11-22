@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">
+  <defs>
+    <radialGradient id="g" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" stop-color="#3b82f6"/>
+      <stop offset="100%" stop-color="#6366f1"/>
+    </radialGradient>
+  </defs>
+  <!-- Outer eye shape -->
+  <path d="M16 6C8 6 2 16 2 16s6 10 14 10 14-10 14-10S24 6 16 6z" fill="none" stroke="url(#g)" stroke-width="2" stroke-linejoin="round"/>
+  <!-- Iris -->
+  <circle cx="16" cy="16" r="6" fill="url(#g)" opacity="0.85"/>
+  <!-- Pupil -->
+  <circle cx="16" cy="16" r="2.5" fill="#0a0a0a"/>
+  <!-- Light reflection -->
+  <circle cx="14" cy="14.5" r="1.2" fill="#fff" opacity="0.7"/>
+  <!-- Scan line effect -->
+  <line x1="2" y1="16" x2="30" y2="16" stroke="#22d3ee" stroke-width="0.5" opacity="0.4"/>
+</svg>

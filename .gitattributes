@@ -1,0 +1,10 @@
+# Texte normalise en LF dans le depot.
+* text=auto eol=lf
+
+# Les scripts Windows exigent CRLF (labels et goto des .bat cassent sinon).
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+
+# Bibliotheque tierce minifiee : jamais retouchee.
+frontend/vendor/** -text -diff linguist-vendored

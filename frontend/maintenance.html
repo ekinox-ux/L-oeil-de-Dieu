@@ -1,0 +1,125 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' https://fonts.googleapis.com 'unsafe-inline'; font-src https://fonts.gstatic.com; img-src 'self'; connect-src 'self' http://localhost:8500 http://127.0.0.1:8500">
+    <title>L'Oeil de Dieu - Maintenance</title>
+    <link rel="icon" type="image/svg+xml" href="favicon.svg">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&family=Oxanium:wght@400;500;600;700&family=Space+Grotesk:wght@400;500;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+
+    <div id="bg-layer" aria-hidden="true">
+        <div class="blob blob-1"></div>
+        <div class="blob blob-2"></div>
+        <div class="blob blob-3"></div>
+        <div class="blob blob-4"></div>
+        <div class="scanlines"></div>
+    </div>
+
+    <div id="cursor-glow" aria-hidden="true"></div>
+    <div id="scan-line" aria-hidden="true"></div>
+
+    <div id="app">
+        <header id="app-header" class="stats-header">
+            <div class="header-inner">
+                <a href="index.html" class="header-logo">L'OEIL DE DIEU</a>
+                <nav class="header-nav">
+                    <a href="index.html" class="nav-link">Recherche</a>
+                    <a href="stats.html" class="nav-link">Statistiques</a>
+                    <a href="maintenance.html" class="nav-link nav-active">Maintenance</a>
+                </nav>
+                <div class="header-status">
+                    <span class="pulse-dot"></span>
+                    <span>Ops local</span>
+                </div>
+            </div>
+        </header>
+
+        <main class="stats-main maintenance-main">
+            <div class="stats-title-section maintenance-title-section">
+                <div class="maintenance-head-row">
+                    <div>
+                        <div class="page-kicker">OPERATIONS // LOCAL CONTROL</div>
+                        <h1 class="stats-page-title">Maintenance</h1>
+                        <p class="stats-page-subtitle" id="maintenance-subtitle">Vue locale de l'etat des index, locks et analyses</p>
+                    </div>
+                    <div class="maintenance-actions">
+                        <button id="maintenance-clean-locks" class="maintenance-btn">Nettoyer locks analyseur</button>
+                        <button id="maintenance-refresh" class="maintenance-btn">Actualiser</button>
+                    </div>
+                </div>
+            </div>
+
+            <div class="kpi-grid maintenance-kpi-grid">
+                <div class="kpi-card">
+                    <div class="kpi-accent"></div>
+                    <div class="kpi-value" id="maintenance-ready-count">0</div>
+                    <div class="kpi-label">Index prets</div>
+                </div>
+                <div class="kpi-card">
+                    <div class="kpi-accent"></div>
+                    <div class="kpi-value" id="maintenance-loading-count">0</div>
+                    <div class="kpi-label">Index en chargement</div>
+                </div>
+                <div class="kpi-card">
+                    <div class="kpi-accent"></div>
+                    <div class="kpi-value" id="maintenance-error-count">0</div>
+                    <div class="kpi-label">Index en erreur</div>
+                </div>
+                <div class="kpi-card">
+                    <div class="kpi-accent"></div>
+                    <div class="kpi-value" id="maintenance-analyze-running">NON</div>
+                    <div class="kpi-label">Analyse en cours</div>
+                </div>
+            </div>
+
+            <div class="charts-row">
+                <div class="chart-card chart-full">
+                    <div class="chart-card-header">
+                        <h3 class="chart-title">Etat runtime</h3>
+                        <span class="chart-badge" id="maintenance-cache-dir">cache</span>
+                    </div>
+                    <div class="maintenance-overview-grid">
+                        <div class="maintenance-overview-item">
+                            <span class="maintenance-overview-label">Progression analyse</span>
+                            <span class="maintenance-overview-value" id="maintenance-progress">0</span>
+                        </div>
+                        <div class="maintenance-overview-item">
+                            <span class="maintenance-overview-label">Emails trouves</span>
+                            <span class="maintenance-overview-value" id="maintenance-emails-found">0</span>
+                        </div>
+                        <div class="maintenance-overview-item">
+                            <span class="maintenance-overview-label">Telephones trouves</span>
+                            <span class="maintenance-overview-value" id="maintenance-phones-found">0</span>
+                        </div>
+                        <div class="maintenance-overview-item">
+                            <span class="maintenance-overview-label">Dernier run</span>
+                            <span class="maintenance-overview-value" id="maintenance-last-run">-</span>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="charts-row">
+                <div class="chart-card chart-full">
+                    <div class="chart-card-header">
+                        <h3 class="chart-title">Index et chemins</h3>
+                        <span class="chart-badge" id="maintenance-index-count">0 index</span>
+                    </div>
+                    <div id="maintenance-indexes" class="maintenance-indexes"></div>
+                </div>
+            </div>
+        </main>
+    </div>
+
+    <script src="js/config.js?v=6"></script>
+    <script src="js/app-utils.js?v=6"></script>
+    <script src="js/effects.js?v=5"></script>
+    <script src="js/maintenance.js?v=1"></script>
+</body>
+</html>
