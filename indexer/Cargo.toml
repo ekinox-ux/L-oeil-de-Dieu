@@ -4,16 +4,16 @@ version = "5.0.0"
 edition = "2021"
 
 [dependencies]
-tantivy = "0.25"
+tantivy = "0.27"
 serde = { version = "1.0", features = ["derive"] }
 # preserve_order : le JSON brut stocke garde l'ordre des champs de la source.
 serde_json = { version = "1.0", features = ["preserve_order"] }
 walkdir = "2.3"
 clap = { version = "4.0", features = ["derive"] }
 rayon = "1.8"
-indicatif = "0.17"
+indicatif = "0.18"
 anyhow = "1.0"
-toml = "0.8"
-directories = "5.0"
+toml = "1.2"
+directories = "6.0"
 ctrlc = "3.4"
 mimalloc = { version = "0.1", default-features = false }
