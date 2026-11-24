@@ -1,7 +1,7 @@
 fastapi==0.165.0
 uvicorn[standard]==0.54.0
 # Doit rester sur la meme version mineure que le crate Rust tantivy de
-# l'indexeur (0.25): c'est lui qui ecrit le format des index lus ici.
+# l'indexeur (0.27): c'est lui qui ecrit le format des index lus ici.
 tantivy==0.27.0
 slowapi==0.1.10
 python-dotenv==1.2.4
