@@ -12,6 +12,8 @@
     var resultsView = document.getElementById('results-view');
     var searchInput = document.getElementById('search-input');
     var searchInputHeader = document.getElementById('search-input-header');
+    var searchSubmit = document.getElementById('search-submit');
+    var searchSubmitHeader = document.getElementById('search-submit-header');
     var btnHome = document.getElementById('btn-home');
     var resultsCount = document.getElementById('results-count');
     var resultsTime = document.getElementById('results-time');
@@ -57,6 +59,7 @@
             disableSearch = true;
         }
 
+        document.body.setAttribute('data-backend', mode);
         if (heroSystemStatus) heroSystemStatus.textContent = systemText;
         if (heroIndexStatus) heroIndexStatus.textContent = indexText;
         if (headerSystemStatus) headerSystemStatus.textContent = systemText;
@@ -65,7 +68,7 @@
         }
 
         if (!state.isSearching) {
-            [searchInput, searchInputHeader, indexSelect].forEach(function (input) {
+            [searchInput, searchInputHeader, indexSelect, searchSubmit, searchSubmitHeader].forEach(function (input) {
                 if (!input) return;
                 input.disabled = disableSearch;
             });
@@ -88,11 +91,18 @@
 
     function setSearchLoading(isLoading) {
         state.isSearching = isLoading;
+        // L'oeil (iris.js) passe en mode balayage tant que la recherche tourne.
+        document.body.classList.toggle('is-scanning', isLoading);
 
         [searchInput, searchInputHeader].forEach(function (input) {
             if (!input) return;
             input.disabled = isLoading;
             input.setAttribute('aria-busy', isLoading ? 'true' : 'false');
+        });
+
+        [searchSubmit, searchSubmitHeader].forEach(function (button) {
+            if (!button) return;
+            button.disabled = isLoading;
         });
 
         if (indexSelect) {
@@ -463,6 +473,16 @@
                 e.preventDefault();
                 performSearch(this.value);
             }
+        });
+
+        [[searchSubmit, searchInput], [searchSubmitHeader, searchInputHeader]].forEach(function (pair) {
+            var button = pair[0];
+            var input = pair[1];
+            if (!button || !input) return;
+            button.addEventListener('click', function () {
+                if (input.disabled) return;
+                performSearch(input.value);
+            });
         });
 
         btnHome.addEventListener('click', function (e) {

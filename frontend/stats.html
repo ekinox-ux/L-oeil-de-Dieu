@@ -8,29 +8,32 @@
     <link rel="icon" type="image/svg+xml" href="favicon.svg">
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&family=Oxanium:wght@400;500;600;700&family=Space+Grotesk:wght@400;500;700&display=swap" rel="stylesheet">
-    <link rel="stylesheet" href="css/style.css">
+    <link href="https://fonts.googleapis.com/css2?family=Unbounded:wght@400;500;600;700&family=Sora:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="css/style.css?v=7">
     <!-- Chart.js 4.4.7 (MIT) embarque localement: fonctionne hors ligne. -->
     <script src="vendor/chart.umd.min.js"
             integrity="sha384-vsrfeLOOY6KuIYKDlmVH5UiBmgIdB1oEf7p01YgWHuqmOHfZr374+odEv96n9tNC"></script>
 </head>
-<body>
+<body class="iris-dim">
 
-    <div id="bg-layer" aria-hidden="true">
-        <div class="blob blob-1"></div>
-        <div class="blob blob-2"></div>
-        <div class="blob blob-3"></div>
-        <div class="blob blob-4"></div>
-        <div class="scanlines"></div>
-    </div>
-
-    <div id="cursor-glow" aria-hidden="true"></div>
+    <canvas id="iris-canvas" aria-hidden="true"></canvas>
+    <div class="iris-glow" aria-hidden="true"></div>
+    <div class="iris-floor" aria-hidden="true"></div>
     <div id="scan-line" aria-hidden="true"></div>
 
     <div id="app">
         <header id="app-header" class="stats-header">
             <div class="header-inner">
-                <a href="index.html" class="header-logo">L'OEIL DE DIEU</a>
+                <a href="index.html" class="header-logo">
+                    <span class="brand-eye" data-eye="logo" aria-hidden="true">
+                        <span class="eye-halo"></span>
+                        <span class="eye-lid">
+                            <span class="eye-ball"><span class="eye-gaze"><span class="eye-glint"></span></span></span>
+                            <svg class="eye-outline" width="34" height="22" viewBox="0 0 34 22"><path class="eye-line" d="M0 11 Q17 -9 34 11 Q17 31 0 11 Z"/></svg>
+                        </span>
+                    </span>
+                    <span>L'OEIL DE DIEU</span>
+                </a>
                 <nav class="header-nav">
                     <a href="index.html" class="nav-link">Recherche</a>
                     <a href="stats.html" class="nav-link nav-active">Statistiques</a>
@@ -155,7 +158,8 @@
 
     <script src="js/config.js?v=6"></script>
     <script src="js/app-utils.js?v=6"></script>
-    <script src="js/effects.js?v=5"></script>
+    <script src="js/effects.js?v=6"></script>
     <script src="js/stats.js?v=5"></script>
+    <script src="js/iris.js?v=1"></script>
 </body>
 </html>
