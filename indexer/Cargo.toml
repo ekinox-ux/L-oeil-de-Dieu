@@ -4,7 +4,10 @@ version = "5.0.0"
 edition = "2021"
 
 [dependencies]
-tantivy = "0.27"
+# zstd-compression : doc store compresse en zstd (commande `compress`). Le
+# backend a besoin d'un tantivy Python construit avec la meme feature
+# (build_tantivy_zstd.ps1).
+tantivy = { version = "0.27", features = ["zstd-compression"] }
 serde = { version = "1.0", features = ["derive"] }
 # preserve_order : le JSON brut stocke garde l'ordre des champs de la source.
 serde_json = { version = "1.0", features = ["preserve_order"] }

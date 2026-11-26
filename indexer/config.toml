@@ -11,3 +11,8 @@ language = "en"
 use_stemming = false
 use_stop_words = false
 commit_every_n_docs = 100_000
+# Doc store des index crees avec cette config ("zstd" ou "lz4"). Un index
+# existant garde ses reglages : la commande `compress` le convertit en zstd.
+docstore_compression = "zstd"
+zstd_level = 3
+docstore_blocksize = 131_072

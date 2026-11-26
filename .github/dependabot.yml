@@ -4,6 +4,10 @@ updates:
     directory: "/"
     schedule:
       interval: "weekly"
+    ignore:
+      # Recompile localement avec zstd (build_tantivy_zstd.ps1) et lie a la
+      # version du crate Rust de l'indexeur : montee de version manuelle.
+      - dependency-name: "tantivy"
     groups:
       python-dependencies:
         patterns: ["*"]

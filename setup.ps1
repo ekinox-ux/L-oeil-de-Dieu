@@ -64,5 +64,25 @@ foreach ($Requirement in $Requirements) {
     & $VenvPython -m pip install -r $Requirement
 }
 
+# Index compresses en zstd : le wheel PyPI de tantivy ne les lit pas. On
+# reinstalle le build local s'il existe (venv recree), sinon on previent.
+# "Continue" : sous PowerShell 5.1, stderr redirige d'un exe stopperait le script.
+$ErrorActionPreference = "Continue"
+& $VenvPython (Join-Path $ProjectRoot "backend\check_tantivy_zstd.py") *> $null
+$ZstdCheck = $LASTEXITCODE
+$ErrorActionPreference = "Stop"
+if ($ZstdCheck -ne 0) {
+    $Pin = Select-String -LiteralPath (Join-Path $ProjectRoot "backend\requirements.txt") -Pattern '^tantivy==(\S+)'
+    $Wheel = $null
+    if ($Pin) {
+        $Wheel = Get-ChildItem -Path (Join-Path $ProjectRoot "build\wheels") -Filter ("tantivy-{0}+zstd-*.whl" -f $Pin.Matches[0].Groups[1].Value) -ErrorAction SilentlyContinue | Select-Object -First 1
+    }
+    if ($Wheel) {
+        & $VenvPython -m pip install --force-reinstall --no-deps $Wheel.FullName
+    } else {
+        Write-Host "tantivy sans zstd : pour des index compresses, lancez .\build_tantivy_zstd.ps1 -Install"
+    }
+}
+
 Write-Host "Environnement Python 3.14 pret: $VenvPython"
 Write-Host "Lancez ensuite .\start.bat"

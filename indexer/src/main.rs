@@ -59,6 +59,25 @@ enum Commands {
         #[arg(long, default_value_t = 8)]
         batch_size: usize,
     },
+    /// Recompresser le doc store d'un index existant en zstd (gain de place)
+    ///
+    /// Reecrit chaque segment encore en lz4 par lots de --batch-size, sans
+    /// reindexer ni changer les resultats. Reprenable : relancee apres une
+    /// interruption, la commande ne traite que les segments restants.
+    /// Backend arrete : il doit ensuite lire le zstd (build_tantivy_zstd.ps1).
+    Compress {
+        /// Chemin vers le dossier de l'index Tantivy
+        index_path: String,
+        /// Niveau zstd (1 a 22 ; au-dela de 3, gain faible et fusions plus lentes)
+        #[arg(long, default_value_t = 3)]
+        level: i32,
+        /// Taille des blocs compresses du doc store, en octets
+        #[arg(long, default_value_t = 131_072)]
+        blocksize: usize,
+        /// Nombre de segments reecrits par fusion (borne RAM et disque temporaire)
+        #[arg(long, default_value_t = 64)]
+        batch_size: usize,
+    },
     /// Gerer la configuration
     Config {
         #[command(subcommand)]
@@ -99,6 +118,12 @@ fn main() -> Result<()> {
             target_segments,
             batch_size,
         } => indexing::merge(&index_path, target_segments, batch_size),
+        Commands::Compress {
+            index_path,
+            level,
+            blocksize,
+            batch_size,
+        } => indexing::compress(&index_path, level, blocksize, batch_size),
         Commands::Config { action } => match action {
             ConfigAction::Init => {
                 let cfg = config::Config::default();
