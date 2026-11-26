@@ -21,6 +21,9 @@ Projet local d'indexation et d'exploration OSINT autour de fichiers `jsonl`.
 4. Copier `backend\indexes.example.json` en `backend\indexes.local.json` puis
    l'adapter a vos chemins source/index.
 5. Compiler l'indexeur Rust: `powershell -ExecutionPolicy Bypass -File indexer\build_windows.ps1`.
+   Les index compresses en zstd exigent aussi un tantivy Python recompile:
+   `powershell -ExecutionPolicy Bypass -File .\build_tantivy_zstd.ps1 -Install`
+   (voir "Compression zstd et commande `compress`").
 6. Lancer l'ensemble: `start.bat`.
 
 
@@ -381,6 +384,44 @@ l_oeil_de_dieu.exe merge D:\index --target-segments 16 --batch-size 8
   fichiers encore ouverts par le backend ne sont liberes qu'a une passe suivante.
 - `purge` n'enclenche plus de fusion implicite apres sa suppression.
 
+### Compression zstd et commande `compress`
+
+Le doc store (texte brut des documents, plus de la moitie de l'index) etait
+compresse en lz4 par blocs de 16 Ko. Les nouveaux index sont crees en zstd
+niveau 3 par blocs de 128 Ko (`docstore_compression`, `zstd_level`,
+`docstore_blocksize` dans la config). Un index existant garde ses reglages
+tant qu'il n'est pas converti:
+
+```
+l_oeil_de_dieu.exe compress D:\index --batch-size 64
+```
+
+- Reecrit chaque segment encore en lz4 par fusions de `--batch-size`
+  segments: Tantivy recompresse les documents quand le compresseur cible
+  change. Aucune reindexation, et les resultats ne changent pas (positions,
+  termes et documents sont recopies tels quels).
+- Les anciens fichiers sont supprimes au fil des fusions: l'espace temporaire
+  reste borne par un lot. Un Ctrl+C attend la fin du lot en cours; relancer la
+  commande reprend avec les segments restants.
+- Affiche la taille du doc store et de l'index avant/apres.
+- Une fois l'index converti, les indexations suivantes ecrivent en zstd.
+
+Le wheel PyPI de tantivy n'active pas la feature Rust `zstd-compression`: le
+backend refuse alors d'ouvrir un index zstd (message explicite au demarrage).
+`build_tantivy_zstd.ps1` telecharge les sources de la version epinglee dans
+`backend/requirements.txt`, active la feature et construit
+`build\wheels\tantivy-X.Y.Z+zstd-*.whl`; `-Install` l'installe dans le venv
+(backend arrete: Windows verrouille le module charge). `tantivy==X.Y.Z` est
+satisfait par `X.Y.Z+zstd`, donc `setup.ps1` garde ce build; il le reinstalle
+s'il trouve le wheel apres un venv recree. A refaire a chaque montee de
+version de tantivy (Dependabot ignore ce paquet cote pip pour cette raison).
+`venv\Scripts\python backend\check_tantivy_zstd.py` verifie le build installe.
+
+Ordre conseille: arreter l'application, `build_tantivy_zstd.ps1 -Install`,
+`compress` sur chaque index, puis relancer. `merge` peut suivre pour reduire
+le nombre de segments: entre segments zstd, il recopie les blocs sans les
+recompresser.
+
 ### Protection du reset
 
 L'option `index --reset` supprime uniquement une cible reconnue comme index
@@ -465,6 +506,8 @@ pas confondre avec `segments` qui sont des structures internes Tantivy.
 - Audit npm: `npm audit`
 - Build Rust release: `powershell -ExecutionPolicy Bypass -File indexer\build_windows.ps1`
 - Fusion des segments: `indexer\target\release\l_oeil_de_dieu.exe merge <index>`
+- Compression zstd d'un index existant: `indexer\target\release\l_oeil_de_dieu.exe compress <index>`
+- tantivy Python avec zstd (backend arrete): `powershell -ExecutionPolicy Bypass -File .\build_tantivy_zstd.ps1 -Install`
 - Apercu du nettoyage: `powershell -File .\cleanup.ps1`
 - Nettoyage verifie (caches, venv casses archives, `.sqlite.tmp` orphelins,
   locks de tests, temporaires du projet dans `%TEMP%`): `powershell -File .\cleanup.ps1 -Execute`

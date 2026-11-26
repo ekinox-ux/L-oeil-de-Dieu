@@ -107,6 +107,10 @@ class SearchEngine:
         message = str(exc).lower()
         return "lockfile" in message or "failed to acquire lock" in message
 
+    @staticmethod
+    def _is_zstd_unsupported_error(exc: Exception) -> bool:
+        return "zstd-compression" in str(exc)
+
     def _collect_lock_details(self) -> list[dict]:
         details = []
         for lock_path in self._lock_paths():
@@ -138,6 +142,13 @@ class SearchEngine:
         try:
             return tantivy.Index.open(self.index_path)
         except Exception as exc:
+            if self._is_zstd_unsupported_error(exc):
+                # Le message de tantivy recopie tout meta.json : inutile ici.
+                raise IndexOpenError(
+                    f"Index '{self.index_path}' compresse en zstd : le module tantivy "
+                    "installe (wheel PyPI) ne sait pas le lire. Backend arrete, lancez "
+                    r"'.\build_tantivy_zstd.ps1 -Install' a la racine du projet."
+                ) from None
             if not self._is_lock_error(exc):
                 raise IndexOpenError(f"Impossible d'ouvrir l'index '{self.index_path}': {exc}") from exc
 

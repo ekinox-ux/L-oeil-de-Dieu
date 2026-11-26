@@ -698,6 +698,231 @@ fn merge_segments(
     Ok(())
 }
 
+/// Pied de page du doc store Tantivy (`store/footer.rs`) : version (u32),
+/// offset (u64), identifiant du compresseur (u8), puis 15 octets reserves a 0.
+const DOC_STORE_FOOTER_LEN: usize = 28;
+const DOC_STORE_COMPRESSOR_POS: usize = 12;
+const LZ4_COMPRESSOR_ID: u8 = 1;
+const ZSTD_COMPRESSOR_ID: u8 = 4;
+
+/// Compresseur du doc store d'un segment, lu dans son pied de page.
+///
+/// Tantivy ne l'expose pas publiquement. Les octets reserves servent de garde:
+/// s'ils ne sont pas nuls, le format a change et on refuse de deviner.
+fn store_compressor_id(segment: &tantivy::index::Segment) -> Result<u8> {
+    use tantivy::HasLen;
+
+    let segment_id = segment.id().uuid_string();
+    let store = segment
+        .open_read(tantivy::index::SegmentComponent::Store)
+        .with_context(|| format!("Doc store illisible (segment {segment_id})"))?;
+    if store.len() < DOC_STORE_FOOTER_LEN {
+        bail!("Doc store tronque (segment {segment_id})");
+    }
+    let footer = store
+        .slice_from(store.len() - DOC_STORE_FOOTER_LEN)
+        .read_bytes()
+        .with_context(|| format!("Doc store illisible (segment {segment_id})"))?;
+    let footer = footer.as_slice();
+    if footer[DOC_STORE_COMPRESSOR_POS + 1..]
+        .iter()
+        .any(|&byte| byte != 0)
+    {
+        bail!(
+            "Format de doc store inattendu (segment {segment_id}) : cette version de \
+             Tantivy n'est pas prise en charge par `compress`."
+        );
+    }
+    Ok(footer[DOC_STORE_COMPRESSOR_POS])
+}
+
+/// Taille totale des fichiers de l'index et de ses doc stores (`.store`).
+fn index_disk_usage(index_path: &Path) -> Result<(u64, u64)> {
+    let mut total = 0_u64;
+    let mut store = 0_u64;
+    for entry in fs::read_dir(index_path)? {
+        let entry = entry?;
+        let metadata = entry.metadata()?;
+        if !metadata.is_file() {
+            continue;
+        }
+        total += metadata.len();
+        if entry.path().extension().is_some_and(|ext| ext == "store") {
+            store += metadata.len();
+        }
+    }
+    Ok((total, store))
+}
+
+fn format_size(bytes: u64) -> String {
+    const MIB: f64 = 1024.0 * 1024.0;
+    let bytes = bytes as f64;
+    if bytes >= 1024.0 * MIB {
+        format!("{:.1} Go", bytes / (1024.0 * MIB))
+    } else {
+        format!("{:.1} Mo", bytes / MIB)
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct CompressReport {
+    converted_segments: usize,
+    merges: usize,
+    completed: bool,
+}
+
+/// Commande `compress` : passe le doc store d'un index existant en zstd.
+pub fn compress(index_dir: &str, level: i32, blocksize: usize, batch_size: usize) -> Result<()> {
+    let running = Arc::new(AtomicBool::new(true));
+    {
+        let r = running.clone();
+        ctrlc::set_handler(move || {
+            println!("\nInterruption demandee : arret apres la fusion en cours...");
+            r.store(false, Ordering::SeqCst);
+        })
+        .context("Erreur lors de l'installation du handler Ctrl+C")?;
+    }
+    let index_path = Path::new(index_dir);
+    let start = Instant::now();
+    let (total_before, store_before) = index_disk_usage(index_path)?;
+
+    let report = compress_segments(index_path, level, blocksize, batch_size, &running)?;
+
+    let (total_after, store_after) = index_disk_usage(index_path)?;
+    println!("---------------------------------------------------");
+    println!(
+        "Compression {} en {:.1}s : {} segment(s) reecrit(s) en {} fusion(s)",
+        if report.completed {
+            "terminee"
+        } else {
+            "interrompue"
+        },
+        start.elapsed().as_secs_f64(),
+        report.converted_segments,
+        report.merges
+    );
+    println!(
+        "Doc store : {} -> {}",
+        format_size(store_before),
+        format_size(store_after)
+    );
+    println!(
+        "Index     : {} -> {}",
+        format_size(total_before),
+        format_size(total_after)
+    );
+    if !report.completed {
+        println!("Relancez la meme commande : seuls les segments restants seront traites.");
+    }
+    println!("---------------------------------------------------");
+    Ok(())
+}
+
+/// Reecrit en zstd chaque segment dont le doc store est encore en lz4.
+///
+/// Le reglage zstd est applique a l'index puis chaque lot d'au plus
+/// `batch_size` segments lz4 est fusionne : Tantivy recompresse les documents
+/// quand le compresseur cible differe de celui du segment. Les positions et le
+/// reste de l'index sont recopies tels quels, les resultats ne changent pas.
+///
+/// Chaque fusion est validee dans meta.json (avec le nouveau reglage) et les
+/// anciens fichiers sont supprimes au fil de l'eau : l'espace temporaire est
+/// borne par un lot et une interruption laisse un index coherent, que l'on
+/// reprend en relancant la commande.
+fn compress_segments(
+    index_path: &Path,
+    level: i32,
+    blocksize: usize,
+    batch_size: usize,
+    running: &AtomicBool,
+) -> Result<CompressReport> {
+    crate::config::validate_zstd_level(level)?;
+    crate::config::validate_docstore_blocksize(blocksize)?;
+    if batch_size == 0 {
+        bail!("--batch-size doit etre superieur a zero");
+    }
+    let (mut index, _fields) = open_existing_index(index_path)?;
+
+    // Inventaire unique : les segments produits par nos fusions sont en zstd,
+    // et le verrou du writer empeche toute indexation concurrente.
+    let mut pending: Vec<(tantivy::index::SegmentId, u32)> = Vec::new();
+    for segment in index.searchable_segments()? {
+        match store_compressor_id(&segment)? {
+            ZSTD_COMPRESSOR_ID => {}
+            LZ4_COMPRESSOR_ID | 0 => {
+                pending.push((segment.id(), segment.meta().num_docs()));
+            }
+            other => bail!(
+                "Compresseur inconnu (id {other}) pour le segment {}",
+                segment.id().uuid_string()
+            ),
+        }
+    }
+    let total_segments = index.searchable_segment_ids()?.len();
+    println!(
+        "Segments : {} dont {} a recompresser en zstd (niveau {}, blocs de {} Ko, lots de {})",
+        total_segments,
+        pending.len(),
+        level,
+        blocksize / 1024,
+        batch_size
+    );
+    if pending.is_empty() {
+        println!("Rien a faire : le doc store est deja entierement en zstd.");
+        return Ok(CompressReport {
+            converted_segments: 0,
+            merges: 0,
+            completed: true,
+        });
+    }
+
+    let settings = crate::config::zstd_index_settings(level, blocksize);
+    index.settings_mut().docstore_compression = settings.docstore_compression;
+    index.settings_mut().docstore_blocksize = settings.docstore_blocksize;
+    let mut writer: tantivy::IndexWriter<tantivy::TantivyDocument> =
+        index.writer_with_num_threads(1, 64 * 1024 * 1024)?;
+    writer.set_merge_policy(Box::new(tantivy::merge_policy::NoMergePolicy));
+
+    // Les petits segments d'abord : les lots restent homogenes.
+    pending.sort_by_key(|(_, num_docs)| *num_docs);
+    let batches: Vec<_> = pending.chunks(batch_size).collect();
+    let mut report = CompressReport {
+        converted_segments: 0,
+        merges: 0,
+        completed: false,
+    };
+    for (position, batch) in batches.iter().enumerate() {
+        if !running.load(Ordering::SeqCst) {
+            println!("Arret demande : compression interrompue proprement.");
+            break;
+        }
+        let ids: Vec<tantivy::index::SegmentId> = batch.iter().map(|(id, _)| *id).collect();
+        let docs: u64 = batch.iter().map(|(_, num_docs)| u64::from(*num_docs)).sum();
+        println!(
+            "[{}/{}] Recompression de {} segment(s) ({} documents)...",
+            position + 1,
+            batches.len(),
+            ids.len(),
+            docs
+        );
+        writer
+            .merge(&ids)
+            .wait()
+            .context("Echec de la recompression d'un lot de segments")?;
+        report.merges += 1;
+        report.converted_segments += ids.len();
+    }
+    report.completed = report.converted_segments == pending.len();
+
+    // Sous Windows, les fichiers encore ouverts (backend lance) ne peuvent pas
+    // etre supprimes : ils le seront lors d'une prochaine passe.
+    if let Err(error) = writer.garbage_collect_files().wait() {
+        eprintln!("Avertissement : nettoyage des anciens fichiers incomplet : {error}");
+    }
+    writer.wait_merging_threads()?;
+    Ok(report)
+}
+
 fn check_schema_conflict(index_path: &Path, config: &Config, reset: bool) -> Result<()> {
     if index_path.exists() && !reset {
         if let Some(existing) = Config::load_from_index(index_path)? {
@@ -1681,7 +1906,15 @@ mod tests {
     }
 
     fn index_with_segments(dir: &Path, sources: &[&str]) -> (Index, IndexFields) {
-        let (index, fields) = open_or_create_index(dir, &Config::default()).unwrap();
+        index_with_segments_using(dir, sources, &Config::default())
+    }
+
+    fn index_with_segments_using(
+        dir: &Path,
+        sources: &[&str],
+        config: &Config,
+    ) -> (Index, IndexFields) {
+        let (index, fields) = open_or_create_index(dir, config).unwrap();
         let mut writer: tantivy::IndexWriter<tantivy::TantivyDocument> =
             index.writer_with_num_threads(1, 15_000_000).unwrap();
         writer.set_merge_policy(Box::new(tantivy::merge_policy::NoMergePolicy));
@@ -1692,7 +1925,7 @@ mod tests {
             doc.add_text(fields.doc_type, "record");
             doc.add_text(fields.content, "hello world");
             if let Some(raw) = fields.content_raw {
-                doc.add_text(raw, r#"{"v":"hello world"}"#);
+                doc.add_text(raw, format!(r#"{{"v":"hello world {source}"}}"#));
             }
             writer.add_document(doc).unwrap();
             writer.commit().unwrap(); // un segment par document
@@ -1736,6 +1969,175 @@ mod tests {
         assert!(merge_segments(&dir, 0, 8, &AtomicBool::new(true)).is_err());
         assert!(merge_segments(&dir, 4, 1, &AtomicBool::new(true)).is_err());
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    fn lz4_config() -> Config {
+        Config {
+            docstore_compression: "lz4".to_string(),
+            docstore_blocksize: 16 * 1024,
+            ..Config::default()
+        }
+    }
+
+    fn store_compressors(index: &Index) -> Vec<u8> {
+        index
+            .searchable_segments()
+            .unwrap()
+            .iter()
+            .map(|segment| store_compressor_id(segment).unwrap())
+            .collect()
+    }
+
+    fn stored_raw_values(index: &Index, fields: &IndexFields) -> Vec<String> {
+        use tantivy::schema::Value;
+
+        let raw_field = fields.content_raw.unwrap();
+        let searcher = index.reader().unwrap().searcher();
+        let mut values = Vec::new();
+        for segment_reader in searcher.segment_readers() {
+            let store = segment_reader.get_store_reader(0).unwrap();
+            for doc in store.iter::<tantivy::TantivyDocument>(segment_reader.alive_bitset()) {
+                let doc = doc.unwrap();
+                let raw = doc.get_first(raw_field).and_then(|v| v.as_str()).unwrap();
+                values.push(raw.to_string());
+            }
+        }
+        values.sort();
+        values
+    }
+
+    /// Une requete entre guillemets exige les positions : elle doit survivre.
+    fn phrase_hits(index: &Index, fields: &IndexFields) -> usize {
+        let parser = tantivy::query::QueryParser::for_index(index, vec![fields.content]);
+        let query = parser.parse_query("\"hello world\"").unwrap();
+        index
+            .reader()
+            .unwrap()
+            .searcher()
+            .search(&query, &tantivy::collector::Count)
+            .unwrap()
+    }
+
+    #[test]
+    fn compress_rewrites_lz4_segments_in_zstd_without_changing_results() {
+        use tantivy::store::{Compressor, ZstdCompressor};
+
+        let dir = temp_dir("oeil_compress");
+        let sources = ["a", "b", "c", "d", "e"];
+        let (index, fields) = index_with_segments_using(&dir, &sources, &lz4_config());
+        assert!(store_compressors(&index)
+            .iter()
+            .all(|id| *id == LZ4_COMPRESSOR_ID));
+        let raw_before = stored_raw_values(&index, &fields);
+        assert_eq!(raw_before.len(), sources.len());
+        assert_eq!(phrase_hits(&index, &fields), sources.len());
+
+        let report = compress_segments(&dir, 3, 128 * 1024, 2, &AtomicBool::new(true)).unwrap();
+
+        assert_eq!(
+            report,
+            CompressReport {
+                converted_segments: 5,
+                merges: 3,
+                completed: true
+            }
+        );
+        let compressors = store_compressors(&index);
+        assert_eq!(compressors.len(), 3); // lots de 2 + 2 + 1
+        assert!(compressors.iter().all(|id| *id == ZSTD_COMPRESSOR_ID));
+        assert_eq!(stored_raw_values(&index, &fields), raw_before);
+        assert_eq!(phrase_hits(&index, &fields), sources.len());
+
+        let reopened = Index::open_in_dir(&dir).unwrap();
+        assert_eq!(
+            reopened.settings().docstore_compression,
+            Compressor::Zstd(ZstdCompressor {
+                compression_level: Some(3)
+            })
+        );
+        assert_eq!(reopened.settings().docstore_blocksize, 128 * 1024);
+        drop(reopened);
+
+        // L'indexation incrementale suivante ecrit en zstd, quelle que soit la config.
+        let (index_again, fields_again) = open_or_create_index(&dir, &lz4_config()).unwrap();
+        let mut writer: tantivy::IndexWriter<tantivy::TantivyDocument> =
+            index_again.writer_with_num_threads(1, 15_000_000).unwrap();
+        writer.set_merge_policy(Box::new(tantivy::merge_policy::NoMergePolicy));
+        let mut doc = tantivy::TantivyDocument::default();
+        doc.add_text(fields_again.source, "f");
+        doc.add_text(fields_again.content, "hello world");
+        writer.add_document(doc).unwrap();
+        writer.commit().unwrap();
+        writer.wait_merging_threads().unwrap();
+        assert!(store_compressors(&index_again)
+            .iter()
+            .all(|id| *id == ZSTD_COMPRESSOR_ID));
+        drop(index_again);
+        drop(index);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn compress_resumes_and_skips_converted_segments() {
+        let dir = temp_dir("oeil_compress_resume");
+        let (index, _) = index_with_segments_using(&dir, &["a", "b", "c"], &lz4_config());
+
+        let stopped = compress_segments(&dir, 3, 128 * 1024, 2, &AtomicBool::new(false)).unwrap();
+        assert_eq!(
+            stopped,
+            CompressReport {
+                converted_segments: 0,
+                merges: 0,
+                completed: false
+            }
+        );
+        assert!(store_compressors(&index)
+            .iter()
+            .all(|id| *id == LZ4_COMPRESSOR_ID));
+
+        compress_segments(&dir, 3, 128 * 1024, 2, &AtomicBool::new(true)).unwrap();
+        let converted = index.searchable_segment_ids().unwrap();
+        let again = compress_segments(&dir, 3, 128 * 1024, 2, &AtomicBool::new(true)).unwrap();
+
+        assert_eq!(
+            again,
+            CompressReport {
+                converted_segments: 0,
+                merges: 0,
+                completed: true
+            }
+        );
+        assert_eq!(index.searchable_segment_ids().unwrap(), converted);
+        drop(index);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn compress_rejects_invalid_parameters() {
+        let dir = temp_dir("oeil_compress_params");
+        let running = AtomicBool::new(true);
+        assert!(compress_segments(&dir, 0, 128 * 1024, 8, &running).is_err());
+        assert!(compress_segments(&dir, 23, 128 * 1024, 8, &running).is_err());
+        assert!(compress_segments(&dir, 3, 1024, 8, &running).is_err());
+        assert!(compress_segments(&dir, 3, 128 * 1024, 0, &running).is_err());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn index_disk_usage_counts_store_files_apart() {
+        let dir = temp_dir("oeil_disk_usage");
+        fs::write(dir.join("a.store"), vec![0_u8; 300]).unwrap();
+        fs::write(dir.join("a.idx"), vec![0_u8; 200]).unwrap();
+        fs::create_dir(dir.join("sub")).unwrap();
+
+        assert_eq!(index_disk_usage(&dir).unwrap(), (500, 300));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn format_size_switches_from_megabytes_to_gigabytes() {
+        assert_eq!(format_size(5 * 1024 * 1024), "5.0 Mo");
+        assert_eq!(format_size(150 * 1024 * 1024 * 1024 / 10), "15.0 Go");
     }
 
     #[cfg(windows)]

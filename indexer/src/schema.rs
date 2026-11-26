@@ -93,11 +93,16 @@ pub fn open_or_create_index(index_path: &Path, config: &Config) -> Result<(Index
             index_path.display()
         )
     })?;
+    // Un index existant garde ses reglages (meta.json) : seule la commande
+    // `compress` change la compression de son doc store.
     let index = if Index::exists(&directory)? {
         Index::open(directory)?
     } else {
         let (schema, _) = build_schema(config);
-        Index::open_or_create(directory, schema)?
+        Index::builder()
+            .schema(schema)
+            .settings(config.index_settings())
+            .open_or_create(directory)?
     };
     let fields = IndexFields::from_schema(&index.schema())?;
     if config.index_raw_content && fields.content_raw.is_none() {
@@ -260,6 +265,40 @@ mod tests {
         assert!(fields.content_raw.is_some());
         drop(index);
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn new_index_uses_configured_docstore_compression() {
+        use tantivy::store::{Compressor, ZstdCompressor};
+
+        let zstd_dir = temp_dir("oeil_new_zstd");
+        let (index, _) = open_or_create_index(&zstd_dir, &Config::default()).unwrap();
+        assert_eq!(
+            index.settings().docstore_compression,
+            Compressor::Zstd(ZstdCompressor {
+                compression_level: Some(3)
+            })
+        );
+        assert_eq!(index.settings().docstore_blocksize, 128 * 1024);
+        drop(index);
+        // Rouvert, l'index garde ses reglages meme si la config change.
+        let lz4 = Config {
+            docstore_compression: "lz4".to_string(),
+            ..Config::default()
+        };
+        let (index, _) = open_or_create_index(&zstd_dir, &lz4).unwrap();
+        assert!(matches!(
+            index.settings().docstore_compression,
+            Compressor::Zstd(_)
+        ));
+        drop(index);
+        fs::remove_dir_all(zstd_dir).unwrap();
+
+        let lz4_dir = temp_dir("oeil_new_lz4");
+        let (index, _) = open_or_create_index(&lz4_dir, &lz4).unwrap();
+        assert_eq!(index.settings().docstore_compression, Compressor::Lz4);
+        drop(index);
+        fs::remove_dir_all(lz4_dir).unwrap();
     }
 
     #[test]

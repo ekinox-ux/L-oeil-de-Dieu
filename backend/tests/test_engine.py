@@ -254,6 +254,25 @@ def test_open_index_keeps_recent_lockfiles(tmp_path, monkeypatch):
     assert lock_path.exists()
 
 
+def test_open_index_explains_missing_zstd_support(tmp_path, monkeypatch):
+    index_dir = tmp_path / "idx"
+    index_dir.mkdir()
+
+    def fake_open(_path):
+        raise ValueError(
+            "Data corrupted: Meta file cannot be deserialized. Error(\"unsupported variant `zstd`, "
+            "please enable Tantivy's `zstd-compression` feature\"). Content: \"{...}\""
+        )
+
+    monkeypatch.setattr(engine_mod.tantivy.Index, "open", fake_open)
+    with pytest.raises(IndexOpenError) as exc_info:
+        SearchEngine(str(index_dir))
+
+    message = str(exc_info.value)
+    assert "build_tantivy_zstd.ps1 -Install" in message
+    assert "Content" not in message
+
+
 def test_open_index_retries_transient_missing_path(tmp_path, monkeypatch):
     index_dir = tmp_path / "idx"
     index_dir.mkdir()

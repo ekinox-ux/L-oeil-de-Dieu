@@ -3,6 +3,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
+use tantivy::store::{Compressor, ZstdCompressor};
+use tantivy::IndexSettings;
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Config {
@@ -32,6 +34,51 @@ pub struct Config {
     pub max_doc_content_bytes: usize,
     #[serde(default = "default_max_doc_input_bytes")]
     pub max_doc_input_bytes: usize,
+    /// Compression du doc store des index CREES avec cette config ("zstd" ou
+    /// "lz4"). Un index existant garde la sienne : `compress` le convertit.
+    #[serde(default = "default_docstore_compression")]
+    pub docstore_compression: String,
+    #[serde(default = "default_zstd_level")]
+    pub zstd_level: i32,
+    /// Taille des blocs compresses du doc store, en octets.
+    #[serde(default = "default_docstore_blocksize")]
+    pub docstore_blocksize: usize,
+}
+
+pub const ZSTD_LEVEL_RANGE: std::ops::RangeInclusive<i32> = 1..=22;
+pub const DOCSTORE_BLOCKSIZE_RANGE: std::ops::RangeInclusive<usize> = 4 * 1024..=4 * 1024 * 1024;
+
+pub fn validate_zstd_level(level: i32) -> Result<()> {
+    if !ZSTD_LEVEL_RANGE.contains(&level) {
+        bail!(
+            "zstd_level doit etre compris entre {} et {}",
+            ZSTD_LEVEL_RANGE.start(),
+            ZSTD_LEVEL_RANGE.end()
+        );
+    }
+    Ok(())
+}
+
+pub fn validate_docstore_blocksize(blocksize: usize) -> Result<()> {
+    if !DOCSTORE_BLOCKSIZE_RANGE.contains(&blocksize) {
+        bail!(
+            "docstore_blocksize doit etre compris entre {} et {} octets",
+            DOCSTORE_BLOCKSIZE_RANGE.start(),
+            DOCSTORE_BLOCKSIZE_RANGE.end()
+        );
+    }
+    Ok(())
+}
+
+/// Reglages Tantivy d'un doc store zstd.
+pub fn zstd_index_settings(level: i32, blocksize: usize) -> IndexSettings {
+    IndexSettings {
+        docstore_compression: Compressor::Zstd(ZstdCompressor {
+            compression_level: Some(level),
+        }),
+        docstore_blocksize: blocksize,
+        ..IndexSettings::default()
+    }
 }
 
 fn default_writer_memory() -> usize {
@@ -73,6 +120,15 @@ fn default_use_stop_words() -> bool {
 fn default_commit_frequency() -> usize {
     100_000
 }
+fn default_docstore_compression() -> String {
+    "zstd".to_string()
+}
+fn default_zstd_level() -> i32 {
+    3
+}
+fn default_docstore_blocksize() -> usize {
+    128 * 1024
+}
 
 impl Default for Config {
     fn default() -> Self {
@@ -90,6 +146,9 @@ impl Default for Config {
             reader_threads: default_reader_threads(),
             max_doc_content_bytes: default_max_doc_content_bytes(),
             max_doc_input_bytes: default_max_doc_input_bytes(),
+            docstore_compression: default_docstore_compression(),
+            zstd_level: default_zstd_level(),
+            docstore_blocksize: default_docstore_blocksize(),
         }
     }
 }
@@ -156,6 +215,18 @@ impl Config {
         )
     }
 
+    /// Reglages du doc store pour un index cree avec cette config.
+    pub fn index_settings(&self) -> IndexSettings {
+        match self.docstore_compression.as_str() {
+            "lz4" => IndexSettings {
+                docstore_compression: Compressor::Lz4,
+                docstore_blocksize: self.docstore_blocksize,
+                ..IndexSettings::default()
+            },
+            _ => zstd_index_settings(self.zstd_level, self.docstore_blocksize),
+        }
+    }
+
     pub fn sanitize_set(&self) -> HashSet<char> {
         self.sanitize_chars.iter().copied().collect()
     }
@@ -182,6 +253,14 @@ impl Config {
         if self.max_doc_input_bytes == 0 {
             bail!("max_doc_input_bytes doit etre superieur a zero");
         }
+        if !matches!(self.docstore_compression.as_str(), "zstd" | "lz4") {
+            bail!(
+                "docstore_compression doit valoir \"zstd\" ou \"lz4\" (recu : \"{}\")",
+                self.docstore_compression
+            );
+        }
+        validate_zstd_level(self.zstd_level)?;
+        validate_docstore_blocksize(self.docstore_blocksize)?;
         Ok(())
     }
 }
@@ -211,6 +290,82 @@ mod tests {
         assert!(cfg.index_raw_content);
         assert_eq!(cfg.max_doc_content_bytes, 2 * 1024 * 1024);
         assert_eq!(cfg.max_doc_input_bytes, 8 * 1024 * 1024);
+        assert_eq!(cfg.docstore_compression, "zstd");
+        assert_eq!(cfg.zstd_level, 3);
+        assert_eq!(cfg.docstore_blocksize, 128 * 1024);
+    }
+
+    #[test]
+    fn index_settings_follow_docstore_options() {
+        let zstd = Config::default().index_settings();
+        assert_eq!(
+            zstd.docstore_compression,
+            Compressor::Zstd(ZstdCompressor {
+                compression_level: Some(3)
+            })
+        );
+        assert_eq!(zstd.docstore_blocksize, 128 * 1024);
+
+        let lz4 = Config {
+            docstore_compression: "lz4".to_string(),
+            docstore_blocksize: 16 * 1024,
+            ..Config::default()
+        }
+        .index_settings();
+        assert_eq!(lz4.docstore_compression, Compressor::Lz4);
+        assert_eq!(lz4.docstore_blocksize, 16 * 1024);
+    }
+
+    #[test]
+    fn legacy_index_config_without_docstore_options_still_loads() {
+        let dir = temp_dir("oeil_cfg_legacy_docstore");
+        fs::write(
+            dir.join(".schema_config.toml"),
+            "index_raw_content = true
+language = \"en\"
+",
+        )
+        .unwrap();
+
+        let loaded = Config::load_from_index(&dir).unwrap().unwrap();
+
+        assert_eq!(loaded.docstore_compression, "zstd");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn load_rejects_invalid_docstore_options() {
+        let dir = temp_dir("oeil_cfg_invalid_docstore");
+        for (content, expected) in [
+            (
+                "docstore_compression = \"brotli\"
+",
+                "docstore_compression",
+            ),
+            (
+                "zstd_level = 0
+",
+                "zstd_level",
+            ),
+            (
+                "zstd_level = 23
+",
+                "zstd_level",
+            ),
+            (
+                "docstore_blocksize = 1024
+",
+                "docstore_blocksize",
+            ),
+        ] {
+            let path = dir.join("config.toml");
+            fs::write(&path, content).unwrap();
+
+            let error = Config::load(path.to_str()).unwrap_err().to_string();
+
+            assert!(error.contains(expected), "{content} -> {error}");
+        }
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
