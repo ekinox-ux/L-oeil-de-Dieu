@@ -1,7 +1,7 @@
 {
   "private": true,
   "scripts": {
-    "test": "node frontend/tests/test-utils.js && node frontend/tests/test-search.js && node frontend/tests/test-stats.js && node frontend/tests/test-maintenance.js"
+    "test": "node frontend/tests/test-css.js && node frontend/tests/test-utils.js && node frontend/tests/test-search.js && node frontend/tests/test-stats.js && node frontend/tests/test-maintenance.js"
   },
   "devDependencies": {
     "jsdom": "31.0.1"
