@@ -991,8 +991,8 @@ def test_search_paginator_loads_next_page_from_backend(bot_module, monkeypatch):
     assert interaction.response.deferred is True
     assert calls == [(
         '/api/search',
-        {'q': 'test', 'limit': 5, 'offset': 5, 'context': 2500, 'index': 'france'},
-        {'timeout': 180.0},
+        {'q': 'test', 'limit': 5, 'offset': 5, 'context': bot_module.SEARCH_CONTEXT_CHARS, 'index': 'france'},
+        {'timeout': 180.0, 'retry_on_timeout': False},
     )]
     assert view.page == 1
     assert fake_msg.edited_embed is not None
@@ -1089,3 +1089,173 @@ def test_cmd_stats_uses_default_timeout(bot_module, monkeypatch):
     interaction = FakeInteraction()
     asyncio.run(bot_module.cmd_stats.callback(interaction, index=None))
     assert "timeout" not in seen_kw
+
+
+# ---- Revue : cooldown, budget d'embed, timeouts de recherche ----
+
+
+class _RespondingInteractionResponse:
+    def __init__(self, done=False):
+        self.messages = []
+        self._done = done
+
+    def is_done(self):
+        return self._done
+
+    async def send_message(self, content, **kwargs):
+        self.messages.append((content, kwargs))
+        self._done = True
+
+
+class _ErrorInteraction:
+    def __init__(self, done=False):
+        self.response = _RespondingInteractionResponse(done)
+
+
+def test_cooldown_error_answers_the_user(bot_module):
+    """CommandOnCooldown herite de CheckFailure : il doit quand meme repondre."""
+    from discord import app_commands
+
+    error = app_commands.CommandOnCooldown(app_commands.Cooldown(5, 60.0), 42.4)
+    assert isinstance(error, app_commands.CheckFailure)
+    interaction = _ErrorInteraction()
+
+    asyncio.run(bot_module.on_app_command_error(interaction, error))
+
+    assert len(interaction.response.messages) == 1
+    content, kwargs = interaction.response.messages[0]
+    assert "cooldown" in content and "42s" in content
+    assert kwargs.get("ephemeral") is True
+
+
+def test_cooldown_error_skips_when_already_answered(bot_module):
+    from discord import app_commands
+
+    error = app_commands.CommandOnCooldown(app_commands.Cooldown(5, 60.0), 3.0)
+    interaction = _ErrorInteraction(done=True)
+
+    asyncio.run(bot_module.on_app_command_error(interaction, error))
+
+    assert interaction.response.messages == []
+
+
+def test_role_check_failure_sends_nothing_more(bot_module):
+    """has_required_role() a deja repondu : le handler ne repond pas une 2e fois."""
+    from discord import app_commands
+
+    interaction = _ErrorInteraction()
+
+    asyncio.run(bot_module.on_app_command_error(interaction, app_commands.CheckFailure()))
+
+    assert interaction.response.messages == []
+
+
+def _long_hit(i, highlight_at=2000):
+    text = "x" * highlight_at + "TROUVE" + "y" * 3000
+    return {
+        'source': f'C:\\data\\Societe{i}\\f.jsonl',
+        'type': 'record',
+        'score': 1.0,
+        'snippets': [{'text': text, 'highlights': [[highlight_at, highlight_at + 6]]}],
+    }
+
+
+def test_page_of_long_hits_fits_in_embed_and_shows_all_results(bot_module):
+    hits = [_long_hit(i) for i in range(5)]
+
+    text = bot_module.format_hits_page(hits, 1)
+
+    assert len(text) <= bot_module.EMBED_DESCRIPTION_LIMIT
+    for i in range(5):
+        assert f"**{i + 1}. Societe{i}**" in text
+    assert text.count("TROUVE") == 5, "chaque extrait doit garder sa correspondance"
+    assert text.count("```") == 10, "chaque bloc de code doit etre ferme"
+
+
+def test_paginator_embed_respects_discord_limit(bot_module):
+    hits = [_long_hit(i) for i in range(5)]
+    paginator = bot_module.SearchPaginator(query='test', hits=hits, total=5, user_id=1)
+
+    embed = paginator.build_embed()
+
+    assert len(embed.description) <= bot_module.EMBED_DESCRIPTION_LIMIT
+    assert "**5. Societe4**" in embed.description
+
+
+def test_excerpt_centers_on_first_highlight(bot_module):
+    text = "a" * 500 + "CIBLE" + "b" * 500
+
+    excerpt = bot_module._excerpt(text, [[500, 505]], 101)
+
+    assert len(excerpt) <= 101
+    assert "CIBLE" in excerpt
+    assert excerpt.startswith("…") and excerpt.endswith("…")
+
+
+def test_excerpt_without_highlight_keeps_the_start(bot_module):
+    excerpt = bot_module._excerpt("debut " + "z" * 200, [], 50)
+
+    assert excerpt.startswith("debut")
+    assert len(excerpt) <= 50
+
+
+def test_format_hit_neutralizes_code_fences(bot_module):
+    hit = {
+        'source': r'C:\data\ACME\row.jsonl',
+        'type': 'record',
+        'score': 1.0,
+        'snippets': [{'text': 'avant ``` apres', 'highlights': []}],
+    }
+
+    rendered = bot_module.format_hit(hit, 1)
+
+    assert rendered.count("```") == 2
+
+
+def _timeout_session(calls):
+    class FakeCtxTimeout:
+        async def __aenter__(self):
+            raise asyncio.TimeoutError()
+
+        async def __aexit__(self, *a):
+            return False
+
+    class FakeSess:
+        closed = False
+
+        def get(self, url, **kw):
+            calls.append(url)
+            return FakeCtxTimeout()
+
+    return FakeSess()
+
+
+def test_search_timeout_is_not_retried(bot_module, monkeypatch):
+    """Apres un timeout, la recherche tourne encore cote backend : pas de relance."""
+    calls = []
+    monkeypatch.setattr(bot_module, '_http_session', _timeout_session(calls))
+
+    async def fake_sleep(_):
+        pass
+    monkeypatch.setattr(bot_module.asyncio, 'sleep', fake_sleep)
+
+    result = asyncio.run(bot_module.api_get('/api/search', retries=1, retry_on_timeout=False))
+
+    assert result["_error_type"] == "timeout"
+    assert len(calls) == 1
+
+
+def test_cmd_search_disables_timeout_retry_and_asks_short_context(bot_module, monkeypatch):
+    seen = {}
+
+    async def spy_api_get(endpoint, params=None, **kw):
+        seen['params'] = params
+        seen['kw'] = kw
+        return {"total": 0, "hits": [], "query": "test"}
+
+    monkeypatch.setattr(bot_module, 'api_get', spy_api_get)
+    asyncio.run(bot_module.cmd_search.callback(FakeInteraction(), query="test", limit=20, index=None))
+
+    assert seen['kw'].get('retry_on_timeout') is False
+    assert seen['params']['context'] == bot_module.SEARCH_CONTEXT_CHARS
+    assert seen['params']['context'] < 2500

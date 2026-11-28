@@ -47,6 +47,8 @@ Le backend est organise en modules:
 - `engine.py`: wrapper tantivy-py pour la recherche et les stats.
 - `analyzer.py`: analyse des fichiers JSONL sources (emails, telephones).
 - `snippets.py`: extraction de snippets avec surlignage.
+- `query_terms.py`: decoupage des requetes comme le tokenizer de l'index
+  (repli des requetes refusees par le parseur, regex de surlignage).
 - `settings.py`: configuration centralisee via variables d'environnement.
 
 ### Chargement des index
@@ -95,7 +97,12 @@ Variables utiles:
   sans reconstruire une copie `.sqlite.tmp` complete.
 - Une ligne JSONL depassant `OEIL_ANALYZER_MAX_LINE_BYTES` (8 Mio par defaut)
   met le fichier en erreur au lieu de provoquer une allocation sans limite.
-- Les lockfiles trop anciens sont auto-nettoyes (TTL 24h) sauf si un `progress` recent indique encore de l'activite.
+- Un lockfile dont le worker (`worker_pid`) ne tourne plus est supprime
+  aussitot, y compris par le bouton de nettoyage. Avant que le worker ait
+  inscrit son PID, le lock appartient au backend qui l'a lance (`owner_pid`),
+  avec 2 minutes de grace au demarrage. Sinon, les lockfiles trop anciens sont
+  auto-nettoyes (TTL 24h) sauf si un `progress` recent indique encore de
+  l'activite.
 - La cle des artefacts (cache, progression, lock) est le chemin source **tel que
   configure** dans `indexes.local.json`, celui que relisent `/api/stats`,
   `/api/diagnostics` et `doctor.py`. Le chemin resolu sert uniquement au
@@ -113,6 +120,12 @@ Variables utiles:
 
 ## Contrat API de recherche
 `GET /api/search?q=...&limit=20&offset=0&context=2500&index=france`
+
+Une requete que le parseur Tantivy refuse (apostrophe comme `O'Brien`, URL
+`http://...` lue comme un champ, adresse IPv6, parenthese seule) n'echoue plus
+en `400` : chaque mot est relance comme la phrase de ses tokens
+(`o'brien` -> `"o brien"`), ce que l'index aurait de toute facon compare. Un
+`400` ne reste possible que si ce repli echoue aussi.
 
 La pagination standard ne deduplique pas les resultats: `total`, `hits` et les
 pages restent ainsi strictement coherents. `deduplicate=true` active une
@@ -200,8 +213,16 @@ Si les deux champs sont absents, les snippets seront vides (`[]`) sans erreur.
 {"text": "contexte autour du match", "highlights": [[start, end], ...]}
 ```
 - `text`: extrait de `context` caracteres (defaut 2500) autour de chaque occurrence.
-- `highlights`: paires [debut, fin] indiquant les positions du terme dans `text`.
-- Quand aucun match n'est trouve dans le contenu brut, `snippets` est `[]`.
+- `highlights`: paires [debut, fin] indiquant les positions du terme dans `text`,
+  comptees en caracteres Unicode (points de code), pas en unites UTF-16.
+- Le surlignage decoupe la requete comme l'index : `jose.martin@example.com`
+  surligne `jose_martin@example.com`, `o'brien` surligne `O'Brien`, et `martin`
+  ne surligne pas `martinez`. Les termes exclus (`-mot`, `NOT mot`) ne sont pas
+  surlignes. Si une phrase de l'index est coupee par une cle dans le JSON brut,
+  ses mots sont surlignes un par un.
+- Quand aucun terme n'apparait dans le contenu brut (correspondance sur le nom
+  de fichier seul), l'extrait est le debut du document, sans surlignage. Une
+  requete faite uniquement d'operateurs ou d'exclusions donne `[]`.
 
 ## Pagination par canal
 
@@ -219,6 +240,9 @@ Si les deux champs sont absents, les snippets seront vides (`[]`) sans erreur.
 - Pagination **serveur** : chaque bouton charge la page voulue via
   `offset`/`limit`, sans conserver jusqu'a 50 resultats en memoire.
 - Affiche 5 resultats par page (`RESULTS_PER_PAGE`) avec des boutons Discord.
+- Demande `context=300` a l'API et partage les 4 096 caracteres de l'embed
+  entre les resultats de la page : chaque extrait est centre sur sa premiere
+  correspondance, et un long document ne masque plus les suivants.
 - Le parametre `limit` de `/search` fixe le nombre maximal de resultats a
   parcourir (50 au maximum); le footer distingue ce plafond du total brut.
 - Timeout des boutons et vues : 10 minutes (600s), avec desactivation propre a expiration.
@@ -244,7 +268,11 @@ Si les deux champs sont absents, les snippets seront vides (`[]`) sans erreur.
   - `/api/search`: `180s`
   - `/api/breaches`: `45s`
   - autres routes: `30s`
-- Un retry automatique est applique sur timeout et erreur de connexion locale.
+- Un retry automatique est applique sur erreur de connexion locale, et sur
+  timeout sauf pour `/api/search` : la recherche tourne encore cote backend,
+  la relancer doublerait la charge et l'attente.
+- Un cooldown depasse (`/search`, `/stats` : 5 appels par minute) recoit un
+  message ephemere indiquant le delai restant.
 
 ### Acces local au backend
 
@@ -355,13 +383,23 @@ La comparaison des chemins tolere les differences de graphie sous Windows
 doublons, et toutes les graphies deja indexees d'un fichier modifie sont
 remplacees ensemble (y compris par `purge`).
 
-Le remplacement est prepare dans un fichier temporaire borne avant d'envoyer
-la suppression a Tantivy. Les checkpoints sont suspendus tant qu'un
-remplacement est incomplet: une erreur JSON, un Ctrl+C ou une lecture partielle
-ne peut donc pas valider la suppression seule. Les documents d'entree sont
-limites par `max_doc_input_bytes` (8 Mio par defaut), avant le parsing JSON.
-`reader_threads` (2 par defaut) borne le nombre de fichiers prepares en
-parallele et donc l'espace temporaire ainsi que la pression sur les disques.
+Une ligne JSON invalide ou plus longue que `max_doc_input_bytes` (8 Mio par
+defaut, verifie avant le parsing) est ignoree, sans ecarter le reste du
+fichier. Le journal `<index>_errors.log` detaille les premieres lignes
+ignorees de chaque fichier puis donne toujours son bilan (lignes ignorees et
+lignes indexees), et le resume de fin affiche le total des lignes ignorees.
+Un fichier sans aucune ligne valide n'est pas memorise : il sera relu au
+prochain passage.
+
+Rien n'est recopie sur disque pendant l'indexation. Pour remplacer un fichier
+deja indexe, l'indexeur le lit une premiere fois en entier avant d'envoyer la
+suppression des anciens documents a Tantivy, puis une seconde fois pour les
+indexer. Une erreur de lecture pendant la premiere passe laisse donc l'index
+intact, et un fichier devenu entierement invalide ne supprime jamais ses
+anciens documents. Les checkpoints sont suspendus tant qu'un remplacement est
+incomplet : un Ctrl+C ou une lecture partielle ne peut pas valider la
+suppression seule. `reader_threads` (2 par defaut) borne le nombre de fichiers
+lus en parallele et donc la pression sur les disques.
 Le fichier `.source_state.json` est remplace atomiquement apres le commit final.
 
 ### Segments et commande `merge`

@@ -4,6 +4,11 @@ on:
   push:
   pull_request:
 
+# Les jobs ne font que lire le depot : le jeton GITHUB_TOKEN n'a pas besoin
+# de droits en ecriture (recommande pour un depot public).
+permissions:
+  contents: read
+
 jobs:
   python:
     runs-on: windows-latest

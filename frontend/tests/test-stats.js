@@ -154,6 +154,34 @@ async function main() {
     assertEqual(unstable.doc.getElementById('stats-index-select').disabled, true, 'unstable: disables selector');
     unstable.dom.window.close();
 
+    // Changement rapide d'index : la reponse lente de l'ancien index arrive
+    // apres celle du nouveau et ne doit pas l'ecraser.
+    var race = await runScenario(function (url) {
+        if (url.indexOf('/api/indexes') !== -1) {
+            return Promise.resolve(makeResponse(200, [
+                { id: 'lent', name: 'Lent', status: 'ready' },
+                { id: 'rapide', name: 'Rapide', status: 'ready' }
+            ]));
+        }
+        if (url.indexOf('index=lent') !== -1) {
+            return wait(300).then(function () {
+                return makeResponse(200, { total_docs: 111, index_size: '1 Go', index_size_bytes: 1 });
+            });
+        }
+        if (url.indexOf('index=rapide') !== -1) {
+            return Promise.resolve(makeResponse(200, { total_docs: 222, index_size: '2 Go', index_size_bytes: 2 }));
+        }
+        return Promise.resolve(makeResponse(200, { total_docs: 5, index_size: '5 Go', index_size_bytes: 5 }));
+    });
+    var raceSelect = race.doc.getElementById('stats-index-select');
+    raceSelect.value = 'lent';
+    raceSelect.dispatchEvent(new race.win.Event('change'));
+    raceSelect.value = 'rapide';
+    raceSelect.dispatchEvent(new race.win.Event('change'));
+    await wait(600);
+    assertEqual(race.doc.querySelectorAll('.kpi-value')[0].dataset.target, '222', 'race: stale response of previous index is ignored');
+    race.dom.window.close();
+
     console.log('\n' + (passed + failed) + ' tests, ' + passed + ' passed, ' + failed + ' failed');
     if (failed > 0) process.exit(1);
 }

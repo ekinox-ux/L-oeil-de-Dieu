@@ -853,3 +853,94 @@ def test_do_analysis_keeps_configured_source_as_artifact_key(tmp_path, monkeypat
     assert result is not None
     assert result["source_dir"] == configured
     assert result["files_processed"] == 1
+
+
+# ---- Locks dont le processus est mort ----
+
+
+def _finished_pid():
+    import subprocess
+    proc = subprocess.Popen([sys.executable, "-c", "pass"])
+    proc.wait()
+    return proc.pid
+
+
+def _write_lock(source, **fields):
+    analyzer._acquire_lock(source)
+    lock_path = analyzer._get_lock_path(source)
+    data = json.loads(lock_path.read_text(encoding="utf-8"))
+    data.update(fields)
+    lock_path.write_text(json.dumps(data), encoding="utf-8")
+    return lock_path
+
+
+def test_pid_is_running_detects_live_and_finished_processes():
+    assert analyzer._pid_is_running(os.getpid()) is True
+    assert analyzer._pid_is_running(_finished_pid()) is False
+    assert analyzer._pid_is_running(None) is None
+    assert analyzer._pid_is_running("123") is None
+    assert analyzer._pid_is_running(True) is None
+
+
+def test_lock_of_dead_worker_is_removed_without_waiting_24h():
+    source = "C:/fictif/worker_mort"
+    lock_path = _write_lock(source, worker_pid=_finished_pid())
+
+    assert analyzer._find_active_lock() is None
+    assert not lock_path.exists()
+
+
+def test_lock_of_live_worker_is_kept():
+    source = "C:/fictif/worker_vivant"
+    lock_path = _write_lock(source, worker_pid=os.getpid())
+
+    assert analyzer._find_active_lock() == source
+    assert lock_path.exists()
+    analyzer._release_lock(source)
+
+
+def test_lock_without_worker_pid_gets_a_startup_grace_period():
+    source = "C:/fictif/demarrage"
+    lock_path = _write_lock(source, owner_pid=_finished_pid(), worker_pid=None)
+
+    assert analyzer._find_active_lock() == source, "le worker a encore le temps de demarrer"
+
+    old = time.time() - analyzer._LOCK_STARTUP_GRACE_SECONDS - 10
+    os.utime(lock_path, (old, old))
+    assert analyzer._find_active_lock() is None
+    assert not lock_path.exists()
+
+
+def test_cleanup_removes_young_lock_of_dead_worker():
+    source = "C:/fictif/nettoyage"
+    _write_lock(source, worker_pid=_finished_pid())
+
+    result = analyzer.cleanup_stale_analyzer_locks(source)
+
+    assert result["removed"] == [source]
+    assert result["kept"] == []
+
+
+def test_cleanup_keeps_young_lock_of_live_worker():
+    source = "C:/fictif/nettoyage_vivant"
+    _write_lock(source, worker_pid=os.getpid())
+
+    result = analyzer.cleanup_stale_analyzer_locks(source)
+
+    assert result["kept"] == [source]
+    analyzer._release_lock(source)
+
+
+def test_lock_deleted_during_scan_is_ignored(monkeypatch):
+    """Le worker peut supprimer son lock entre la lecture et stat()."""
+    source = "C:/fictif/course"
+    _write_lock(source, worker_pid=os.getpid())
+    monkeypatch.setattr(analyzer, "_lock_age", lambda _entry, _now: None)
+
+    assert analyzer._find_active_lock() is None
+    assert analyzer.cleanup_stale_analyzer_locks(source) == {"removed": [], "kept": []}
+    analyzer._release_lock(source)
+
+
+def test_lock_age_of_missing_file_is_none(tmp_path):
+    assert analyzer._lock_age(tmp_path / "absent.lock", time.time()) is None

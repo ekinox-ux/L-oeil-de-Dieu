@@ -139,8 +139,13 @@ async def _api_get_once(endpoint: str, params: dict | None, timeout_seconds: flo
 async def api_get(endpoint: str, params: dict = None, *,
                   log_connection_error: bool = True,
                   timeout: float = 30.0,
-                  retries: int = 1) -> dict | None:
+                  retries: int = 1,
+                  retry_on_timeout: bool = True) -> dict | None:
     """Appel GET vers le backend avec retry sur timeout/connexion.
+
+    retry_on_timeout=False sert aux recherches : apres un timeout, la requete
+    tourne encore cote backend, la relancer doublerait la charge et l'attente.
+    Une connexion impossible reste retentee.
 
     Retourne:
       - dict sans _error : succes
@@ -153,7 +158,7 @@ async def api_get(endpoint: str, params: dict = None, *,
         # Succes ou erreur applicative (pas transitoire) : retourner immediatement
         if result is not None:
             error_type = result.get("_error_type", "")
-            if error_type not in ("timeout",):
+            if error_type != "timeout" or not retry_on_timeout:
                 return result
             # Timeout : retenter si retries restants
             last_result = result
@@ -180,8 +185,41 @@ async def wait_for_backend(attempts: int = 20, delay_seconds: float = 2.0) -> di
 
 # ---- Formatage des resultats ----
 
-def format_hit(hit: dict, index: int) -> str:
-    """Formate un resultat de recherche en texte."""
+# Limite Discord de la description d'un embed.
+EMBED_DESCRIPTION_LIMIT = 4096
+# Contexte demande a l'API autour de chaque correspondance : 5 resultats
+# doivent tenir dans un embed, inutile de rapatrier 2 x 2500 caracteres.
+SEARCH_CONTEXT_CHARS = 300
+# Extrait par resultat quand la page n'impose pas de budget plus petit.
+MAX_SNIPPET_CHARS = 1500
+_CODE_FENCE_OVERHEAD = len("\n```\n\n```")
+
+
+def _excerpt(text: str, highlights: list | None, max_chars: int) -> str:
+    """Coupe un extrait a max_chars en gardant la premiere correspondance visible."""
+    if len(text) <= max_chars:
+        return text
+    width = max_chars - 2  # place des deux marqueurs de coupure
+    if width <= 0:
+        return text[:max_chars]
+    start = 0
+    if highlights:
+        hl_start, hl_end = highlights[0][0], highlights[0][1]
+        start = max(0, hl_start - max(0, width - (hl_end - hl_start)) // 2)
+    start = min(start, len(text) - width)
+    end = start + width
+    prefix = "…" if start > 0 else ""
+    suffix = "…" if end < len(text) else ""
+    return prefix + text[start:end] + suffix
+
+
+def format_hit(hit: dict, index: int, max_snippet_chars: int = MAX_SNIPPET_CHARS) -> str:
+    """Formate un resultat de recherche en texte.
+
+    L'extrait est borne a max_snippet_chars et centre sur la premiere
+    correspondance. Les ``` du contenu sont neutralises pour ne pas fermer le
+    bloc de code.
+    """
     source = hit.get("source", "Inconnu")
     parts = source.replace("\\", "/").split("/")
     name = "Inconnu"
@@ -193,15 +231,33 @@ def format_hit(hit: dict, index: int) -> str:
     score = hit.get("score", 0)
     hit_type = hit.get("type", "?")
 
+    header = f"**{index}. {name}** ({hit_type}) — score: {score:.2f}"
     snippets = hit.get("snippets", [])
-    snippet_text = ""
-    if snippets:
-        text = snippets[0].get("text", "")
-        if len(text) > 2500:
-            text = text[:2500] + "..."
-        snippet_text = f"\n```\n{text}\n```"
+    if not snippets:
+        return header
+    text = _excerpt(snippets[0].get("text", ""), snippets[0].get("highlights"), max_snippet_chars)
+    text = text.replace("```", "`\u200b``")
+    if not text.strip():
+        return header
+    return f"{header}\n```\n{text}\n```"
 
-    return f"**{index}. {name}** ({hit_type}) — score: {score:.2f}{snippet_text}"
+
+def format_hits_page(hits: list, first_number: int, max_chars: int = EMBED_DESCRIPTION_LIMIT) -> str:
+    """Formate une page de resultats sans depasser max_chars.
+
+    La place est partagee entre les resultats : un extrait long ne masque plus
+    les suivants, et les blocs de code restent fermes.
+    """
+    if not hits:
+        return ""
+    headers = [format_hit({**hit, "snippets": []}, first_number + i) for i, hit in enumerate(hits)]
+    available = max_chars - 2 * (len(hits) - 1) - sum(len(h) for h in headers)
+    budget = min(MAX_SNIPPET_CHARS, available // len(hits) - _CODE_FENCE_OVERHEAD)
+    if budget < 20:
+        blocks = headers
+    else:
+        blocks = [format_hit(hit, first_number + i, budget) for i, hit in enumerate(hits)]
+    return truncate("\n\n".join(blocks), max_chars)
 
 
 def truncate(text: str, max_len: int = 4096) -> str:
@@ -561,13 +617,9 @@ class SearchPaginator(discord.ui.View):
             end = start + RESULTS_PER_PAGE
             page_hits = self.hits[start:end]
 
-        results_text = "\n\n".join(
-            format_hit(hit, start + i + 1) for i, hit in enumerate(page_hits)
-        )
-
         embed = discord.Embed(
             title=f"Recherche : {self.query}",
-            description=truncate(results_text),
+            description=format_hits_page(page_hits, start + 1),
             color=0x3b82f6,
         )
         loaded = len(self.hits)
@@ -592,12 +644,12 @@ class SearchPaginator(discord.ui.View):
             "q": self.query,
             "limit": page_limit,
             "offset": offset,
-            "context": 2500,
+            "context": SEARCH_CONTEXT_CHARS,
         }
         if self.index:
             params["index"] = self.index
 
-        data = await api_get("/api/search", params, timeout=180.0)
+        data = await api_get("/api/search", params, timeout=180.0, retry_on_timeout=False)
         if data is None or data.get("_error"):
             await interaction.followup.send(embed=_error_embed(data), ephemeral=True)
             return False
@@ -731,10 +783,15 @@ async def cmd_search(interaction: discord.Interaction, query: str, limit: int = 
 
     await interaction.response.defer(thinking=True)
 
-    params = {"q": query, "limit": min(limit, RESULTS_PER_PAGE), "offset": 0, "context": 2500}
+    params = {
+        "q": query,
+        "limit": min(limit, RESULTS_PER_PAGE),
+        "offset": 0,
+        "context": SEARCH_CONTEXT_CHARS,
+    }
     if index:
         params["index"] = index
-    data = await api_get("/api/search", params, timeout=180.0)
+    data = await api_get("/api/search", params, timeout=180.0, retry_on_timeout=False)
 
     if data is None or data.get("_error"):
         await interaction.followup.send(embed=_error_embed(data))
@@ -819,12 +876,16 @@ async def cmd_stats(interaction: discord.Interaction, index: str = None):
 
 @bot.tree.error
 async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
-    if isinstance(error, app_commands.CheckFailure):
-        return
+    # CommandOnCooldown herite de CheckFailure : il doit etre teste en premier,
+    # sinon l'utilisateur ne recoit aucune reponse.
     if isinstance(error, app_commands.CommandOnCooldown):
-        await interaction.response.send_message(
-            f"Commande en cooldown. Reessayez dans {error.retry_after:.0f}s.", ephemeral=True
-        )
+        if not interaction.response.is_done():
+            await interaction.response.send_message(
+                f"Commande en cooldown. Reessayez dans {error.retry_after:.0f}s.", ephemeral=True
+            )
+        return
+    if isinstance(error, app_commands.CheckFailure):
+        # has_required_role() a deja repondu a l'utilisateur.
         return
     logger.error("Erreur commande: %s", error)
     if not interaction.response.is_done():

@@ -23,7 +23,6 @@ set "PS_GET_BACKEND_READY=try { $h = Invoke-RestMethod -Uri http://127.0.0.1:%BA
 set "PS_GET_BACKEND_UP=try { $null = Invoke-RestMethod -Uri http://127.0.0.1:%BACKEND_PORT%/api/health -TimeoutSec 2; exit 0 } catch { exit 1 }"
 set "PS_HAS_BACKEND_LISTENER=$listenerPid = Get-NetTCPConnection -LocalPort %BACKEND_PORT% -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty OwningProcess; if ($listenerPid) { exit 0 } else { exit 1 }"
 set "PS_BACKEND_PROCESS_RUNNING=if (-not (Test-Path -LiteralPath '%BACKEND_PID_FILE%')) { exit 1 }; $trackedPid = Get-Content -LiteralPath '%BACKEND_PID_FILE%' -ErrorAction SilentlyContinue | Select-Object -First 1; if ($trackedPid -and (Get-Process -Id ([int]$trackedPid) -ErrorAction SilentlyContinue)) { exit 0 } else { exit 1 }"
-set "PS_BOT_PROCESS_RUNNING=if (-not (Test-Path -LiteralPath '%BOT_PID_FILE%')) { exit 1 }; $trackedPid = Get-Content -LiteralPath '%BOT_PID_FILE%' -ErrorAction SilentlyContinue | Select-Object -First 1; if ($trackedPid -and (Get-Process -Id ([int]$trackedPid) -ErrorAction SilentlyContinue)) { exit 0 } else { exit 1 }"
 
 rem -- Detection collision port backend (lancee apres l'arret de nos propres process) --
 rem N'ecrit rien si le port est libre; sinon affiche PID, nom et commandline du detenteur.
@@ -244,15 +243,22 @@ set "BACKEND_RESTART_COOLDOWN=60"
 goto :eof
 
 :watch_bot
-rem Relance le bot s'il s'est arrete (crash, coupure reseau), avec un delai
-rem d'environ 60 tours de boucle entre deux relances.
+rem Relance le bot s'il s'est arrete (crash, coupure reseau). Le controle a
+rem lieu tous les 5 tours de boucle environ, avec tasklist plutot qu'un
+rem PowerShell lance chaque seconde ; apres une relance, il attend environ
+rem 60 tours.
 if not "%BOT_STARTED%"=="1" goto :eof
 if %BOT_RESTART_COOLDOWN% gtr 0 (
     set /a BOT_RESTART_COOLDOWN-=1
     goto :eof
 )
-powershell -NoProfile -Command "%PS_BOT_PROCESS_RUNNING%" >nul 2>&1
-if not errorlevel 1 goto :eof
+set "BOT_RESTART_COOLDOWN=5"
+set "BOT_PID="
+if exist "%BOT_PID_FILE%" set /p BOT_PID=<"%BOT_PID_FILE%"
+if defined BOT_PID (
+    tasklist /FI "PID eq %BOT_PID%" /NH 2>nul | find /I "python" >nul
+    if not errorlevel 1 goto :eof
+)
 echo.
 echo [ATTENTION] Bot arrete. Relance...
 call :log Bot arrete - relance automatique

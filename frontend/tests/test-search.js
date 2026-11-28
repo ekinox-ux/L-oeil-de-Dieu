@@ -732,3 +732,26 @@ pendingTests++;
         }
     );
 })();
+
+// Positions des highlights en points de code (backend Python) et URLs sures
+pendingTests++;
+(function testSnippetOffsetsAndSafeUrls() {
+    var dom = loadProductionCode(function () {
+        return Promise.resolve({ ok: true, json: function () { return Promise.resolve({}); } });
+    });
+    var components = dom.window.SearchComponents;
+
+    // "😀 " occupe 2 points de code mais 3 unites UTF-16.
+    var html = components.renderSnippet({ text: '😀 jose martin', highlights: [[2, 6]] });
+    assertEqual(html, '😀 <mark>jose</mark> martin', 'renderSnippet: offsets after emoji use code points');
+
+    html = components.renderSnippet({ text: 'a<b> c', highlights: [[0, 4], [2, 3], [9, 12]] });
+    assertEqual(html, '<mark>a&lt;b&gt;</mark> c', 'renderSnippet: overlapping and out-of-range highlights ignored');
+
+    assertEqual(components.safeHttpUrl('https://example.com/a'), 'https://example.com/a', 'safeHttpUrl: keeps https');
+    assertEqual(components.safeHttpUrl('javascript:alert(1)'), null, 'safeHttpUrl: rejects javascript:');
+    assertEqual(components.safeHttpUrl('data:text/html,x'), null, 'safeHttpUrl: rejects data:');
+    assertEqual(components.safeHttpUrl('pas une url'), null, 'safeHttpUrl: rejects garbage');
+    dom.window.close();
+    testDone();
+})();

@@ -1,5 +1,6 @@
 import re
 
+from query_terms import highlight_patterns
 from settings import MAX_QUERY_LENGTH
 
 
@@ -10,6 +11,12 @@ def extract_snippets(raw_content: str, query: str, context_chars: int = 2500, ma
     """Extrait des snippets du contenu brut avec contexte autour des termes recherches.
 
     Retourne une liste de dicts: {"text": str, "highlights": [(start, end), ...]}
+
+    Le surlignage decoupe la requete comme l'index : `jose.martin@example.com`
+    surligne `jose_martin@example.com`, que la recherche a trouve. Si aucune
+    unite n'apparait telle quelle (phrase coupee par une cle JSON dans le
+    contenu brut), les tokens sont surlignes un par un. Les positions sont en
+    caracteres (points de code).
     """
     if not raw_content or not query:
         return []
@@ -21,34 +28,23 @@ def extract_snippets(raw_content: str, query: str, context_chars: int = 2500, ma
     if len(raw_content) > MAX_CONTENT_SIZE:
         raw_content = raw_content[:MAX_CONTENT_SIZE]
 
-    # Extraire les termes de la query (ignorer les operateurs)
-    operators = {"AND", "OR", "NOT", "TO"}
-    terms = []
-    for part in re.findall(r'"[^"]+"|[\w*.@]+', query):
-        clean = part.strip('"')
-        if clean.upper() not in operators and len(clean) > 1:
-            terms.append(clean)
-
-    if not terms:
+    unit_patterns, token_patterns = highlight_patterns(query)
+    if not unit_patterns:
         return []
 
-    # Construire le pattern de recherche
-    patterns = []
-    for term in terms:
-        escaped = re.escape(term)
-        if escaped.endswith(r"\*"):
-            # Prefix search: dev* -> dev\w*
-            escaped = escaped[:-2] + r"\w*"
-        patterns.append(escaped)
+    matches = []
+    for patterns in (unit_patterns, token_patterns):
+        if not patterns:
+            continue
+        try:
+            # Le motif le plus long d'abord : "jean dupont" l'emporte sur jean.
+            regex = re.compile("|".join(sorted(patterns, key=len, reverse=True)), re.IGNORECASE)
+        except re.error:
+            return []
+        matches = list(regex.finditer(raw_content))
+        if matches:
+            break
 
-    combined = "|".join(patterns)
-    try:
-        regex = re.compile(combined, re.IGNORECASE)
-    except re.error:
-        return []
-
-    # Trouver toutes les occurrences
-    matches = list(regex.finditer(raw_content))
     if not matches:
         # Fallback: retourner le debut du contenu
         preview = raw_content[:context_chars * 2].strip()
@@ -79,10 +75,13 @@ def extract_snippets(raw_content: str, query: str, context_chars: int = 2500, ma
 
         snippet_text = raw_content[start:end]
 
-        # Recalculer les positions des highlights dans le snippet
-        highlights = []
-        for m in regex.finditer(snippet_text):
-            highlights.append((m.start(), m.end()))
+        # Correspondances trouvees sur le contenu entier : les bornes de mot
+        # restent justes au bord de l'extrait.
+        highlights = [
+            (m.start() - start, m.end() - start)
+            for m in matches
+            if m.start() >= start and m.end() <= end
+        ]
 
         # Ajouter des ellipses si tronque
         prefix = "..." if start > 0 else ""
