@@ -92,7 +92,7 @@ pub fn run(
     no_dedup: bool,
 ) -> Result<()> {
     let start = Instant::now();
-    let config = Config::load(config_path)?;
+    let mut config = Config::load(config_path)?;
     let source_path = Path::new(source);
     let index_path = Path::new(index_dir);
 
@@ -106,6 +106,7 @@ pub fn run(
         None
     };
 
+    resolve_index_options(&mut config, index_path, reset)?;
     check_schema_conflict(index_path, &config, reset)?;
 
     if let Some(target) = reset_target {
@@ -137,8 +138,10 @@ pub fn run(
     );
 
     println!(
-        "Configuration chargee (Langue: {} | Raw content: {})",
-        config.language, config.index_raw_content
+        "Configuration chargee (Langue: {} | Raw content: {} | Accents ignores: {})",
+        config.language,
+        config.index_raw_content,
+        config.ascii_folding_enabled()
     );
 
     let (index, fields) = open_or_create_index(index_path, &config)?;
@@ -929,6 +932,20 @@ fn compress_segments(
     }
     writer.wait_merging_threads()?;
     Ok(report)
+}
+
+/// Fixe les options laissees par defaut selon l'index vise : un index existant
+/// garde son reglage d'accents (les anciens n'en ont pas : accents conserves),
+/// un nouvel index ou un --reset les ignore.
+fn resolve_index_options(config: &mut Config, index_path: &Path, reset: bool) -> Result<()> {
+    if reset {
+        config.resolve_ascii_folding(None, false);
+    } else {
+        let existing = Config::load_from_index(index_path)?;
+        let index_exists = index_path.join("meta.json").exists();
+        config.resolve_ascii_folding(existing.as_ref(), index_exists);
+    }
+    Ok(())
 }
 
 fn check_schema_conflict(index_path: &Path, config: &Config, reset: bool) -> Result<()> {
@@ -1845,6 +1862,45 @@ mod tests {
         let result = check_schema_conflict(&dir, &new_config, true);
         assert!(result.is_ok(), "reset=true should skip conflict check");
 
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn legacy_index_keeps_accents_without_conflict() {
+        let dir = temp_dir("oeil_fold_legacy");
+        // .schema_config.toml d'avant l'option : pas de cle ascii_folding.
+        fs::write(dir.join(".schema_config.toml"), "language = \"en\"\n").unwrap();
+        fs::write(dir.join("meta.json"), "{}").unwrap();
+
+        let mut config = Config::default();
+        resolve_index_options(&mut config, &dir, false).unwrap();
+        assert_eq!(config.ascii_folding, Some(false));
+        assert!(check_schema_conflict(&dir, &config, false).is_ok());
+
+        // Demander les accents ignores sur cet index impose un --reset.
+        let mut explicit = Config {
+            ascii_folding: Some(true),
+            ..Config::default()
+        };
+        resolve_index_options(&mut explicit, &dir, false).unwrap();
+        let error = check_schema_conflict(&dir, &explicit, false).unwrap_err();
+        assert!(error.to_string().contains("fold:true"));
+
+        // Reconstruit avec --reset : accents ignores par defaut.
+        let mut rebuilt = Config::default();
+        resolve_index_options(&mut rebuilt, &dir, true).unwrap();
+        assert_eq!(rebuilt.ascii_folding, Some(true));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn new_index_ignores_accents_by_default() {
+        let dir = temp_dir("oeil_fold_new");
+        let mut config = Config::default();
+
+        resolve_index_options(&mut config, &dir.join("absent"), false).unwrap();
+
+        assert_eq!(config.ascii_folding, Some(true));
         fs::remove_dir_all(dir).unwrap();
     }
 

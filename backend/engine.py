@@ -4,20 +4,31 @@ import os
 import threading
 import time
 import tomllib
+from dataclasses import dataclass
 from pathlib import Path
 
 import tantivy
 from tantivy import Filter, TextAnalyzerBuilder, Tokenizer
 
-from query_terms import quote_query_terms
-from settings import INDEX_PATH_CHECK_ATTEMPTS, INDEX_PATH_CHECK_DELAY_MS
+from query_terms import query_candidates
+from search_cache import CachedRanking, ResultCache
+from settings import (
+    INDEX_PATH_CHECK_ATTEMPTS,
+    INDEX_PATH_CHECK_DELAY_MS,
+    SEARCH_CACHE_ENTRIES,
+    SEARCH_CACHE_TTL_SECONDS,
+)
 
 logger = logging.getLogger("oeil-engine")
 _STATS_TTL_SECONDS = 300       # cache stats legeres (num_docs, segments) : 5 min
 _INDEX_SIZE_TTL_SECONDS = 3600  # cache taille index (os.walk) : 1 h
 _RELOAD_INTERVAL_SECONDS = 30.0  # throttle reload() : au plus 1 fois toutes les 30 s
 _LOCK_FILENAMES = (".tantivy-meta.lock", ".tantivy-writer.lock")
-_DEFAULT_SEARCH_FIELDS = ["content", "filename"]
+# Le nom du fichier n'est plus cherche par defaut : toutes les lignes d'une
+# fuite le partagent, un mot qui y figure faisait correspondre le fichier
+# entier. `filename:mot` reste disponible pour filtrer volontairement.
+_DEFAULT_SEARCH_FIELDS = ["content"]
+_CACHE_LOCK = threading.Lock()
 # Codes acceptes par l'indexeur Rust -> noms attendus par tantivy-py.
 _TANTIVY_PY_LANGUAGES = {
     "fr": "french",
@@ -41,8 +52,28 @@ class IndexOpenError(RuntimeError):
     """Erreur d'ouverture de l'index avec diagnostic operable."""
 
 
+@dataclass
+class HitPage:
+    """Fenetre d'un classement, avant lecture des documents."""
+
+    searcher: object
+    # Couples (score, adresse) de la fenetre demandee.
+    hits: list
+    # None quand le total n'a pas ete compte (pages suivantes).
+    total: int | None
+    has_more: bool
+    # Rien trouve en exigeant tous les mots, et la requete en OU differe.
+    relaxable: bool = False
+
+
 class SearchEngine:
     """Wrapper autour de tantivy-py pour lire l'index cree par le Rust."""
+
+    # Valeurs par defaut de classe : les doubles de tests construits sans
+    # __init__ restent utilisables.
+    ascii_folding = False
+    _index_signature = None
+    _result_cache = None
 
     def __init__(self, index_path: str):
         init_started_at = time.time()
@@ -73,6 +104,7 @@ class SearchEngine:
         self.index.reload()
         reload_elapsed = time.time() - reload_started_at
         self._last_reload_at = time.monotonic()
+        self._index_signature = self._read_index_signature()
         total_elapsed = time.time() - init_started_at
         logger.info(
             "SearchEngine init '%s': open=%.2fs tokenizer=%.2fs reload=%.2fs total=%.2fs",
@@ -193,9 +225,12 @@ class SearchEngine:
         max_word_length = int(config.get("max_word_length", 250))
         use_stemming = bool(config.get("use_stemming", False))
         use_stop_words = bool(config.get("use_stop_words", False))
+        # Absent d'un index construit avant l'option : accents conserves.
+        self.ascii_folding = bool(config.get("ascii_folding", False))
         language = self._tantivy_py_language(str(config.get("language", "en")))
 
-        # Meme ordre que l'indexeur Rust: remove_long, lowercase, stemmer, stopword.
+        # Meme ordre que l'indexeur Rust: remove_long, lowercase, stemmer,
+        # stopword, ascii_fold.
         builder = TextAnalyzerBuilder(Tokenizer.simple())
         builder = builder.filter(Filter.remove_long(max_word_length))
         builder = builder.filter(Filter.lowercase())
@@ -203,6 +238,8 @@ class SearchEngine:
             builder = builder.filter(Filter.stemmer(language))
         if use_stop_words:
             builder = builder.filter(Filter.stopword(language))
+        if self.ascii_folding:
+            builder = builder.filter(Filter.ascii_fold())
         return builder.build()
 
     @staticmethod
@@ -279,91 +316,184 @@ class SearchEngine:
                     "reload() a pris %.2fs pour '%s'",
                     elapsed, self.index_path,
                 )
+            signature = self._read_index_signature()
+            if signature != self._index_signature:
+                # Nouveau commit : les classements en cache sont perimes.
+                self._index_signature = signature
+                self._get_result_cache().clear()
         except Exception:
             logger.exception("reload() echoue pour '%s'", self.index_path)
         finally:
             with self._reload_lock:
                 self._reload_in_progress = False
 
-    def _parse_query(self, query: str):
+    def _read_index_signature(self):
+        """Empreinte du dernier commit : meta.json est reecrit a chaque commit."""
+        try:
+            stat = (Path(self.index_path) / "meta.json").stat()
+        except (OSError, TypeError):
+            return None
+        return (stat.st_mtime_ns, stat.st_size)
+
+    def _get_result_cache(self) -> ResultCache:
+        cache = self._result_cache
+        if cache is None:
+            with _CACHE_LOCK:
+                cache = self._result_cache
+                if cache is None:
+                    cache = ResultCache(SEARCH_CACHE_ENTRIES, SEARCH_CACHE_TTL_SECONDS)
+                    self._result_cache = cache
+        return cache
+
+    def _parse_query(self, query: str, conjunction: bool = False):
         """Analyse la requete, avec repli sur des phrases si la syntaxe est refusee.
 
         Le parseur Tantivy rejette O'Brien, une URL (`http:` lu comme un champ),
         une adresse IPv6 ou une parenthese seule. Chaque mot est alors cherche
         comme la phrase de ses tokens, ce que l'index aurait de toute facon
         compare : la recherche aboutit au lieu de renvoyer une erreur 400.
+        Un numero de telephone est etendu a ses ecritures (query_terms).
+        conjunction exige chaque mot ; un OR ecrit explicitement reste un OU.
         """
-        try:
-            return self.index.parse_query(query, _DEFAULT_SEARCH_FIELDS)
-        except Exception as exc:
-            first_error = exc
-        tried = {query}
-        for keep_operators in (True, False):
-            fallback = quote_query_terms(query, keep_operators=keep_operators)
-            if not fallback or fallback in tried:
-                continue
-            tried.add(fallback)
+        first_error = None
+        for candidate in query_candidates(query):
             try:
-                return self.index.parse_query(fallback, _DEFAULT_SEARCH_FIELDS)
-            except Exception:
-                continue
+                return self.index.parse_query(
+                    candidate, _DEFAULT_SEARCH_FIELDS, conjunction_by_default=conjunction,
+                )
+            except Exception as exc:
+                if first_error is None:
+                    first_error = exc
+        if first_error is None:
+            first_error = ValueError("requete vide")
         raise SearchQueryError(str(first_error)) from first_error
 
-    def search(self, query: str, limit: int = 20, offset: int = 0) -> dict:
+    def _can_relax(self, query: str) -> bool:
+        """Vrai si la requete en OU differe de celle qui exige chaque mot."""
+        try:
+            parsed_all = self._parse_query(query, conjunction=True)
+            parsed_any = self._parse_query(query, conjunction=False)
+        except SearchQueryError:
+            return False
+        return repr(parsed_all) != repr(parsed_any)
+
+    def find(
+        self,
+        query: str,
+        limit: int = 20,
+        offset: int = 0,
+        *,
+        match_all: bool = True,
+        count: bool = True,
+    ) -> HitPage:
+        """Classe les documents sans les lire.
+
+        Le classement est garde en cache : la page suivante ou precedente le
+        reprend sans relancer Tantivy. count=False evite de compter toutes
+        les correspondances, la partie la plus couteuse sur un mot courant.
+        """
         self._maybe_reload()
-        try:
-            searcher = self.index.searcher()
-        except Exception as exc:
-            raise IndexAccessError(f"Index indisponible '{self.index_path}': {exc}") from exc
+        needed = offset + limit + 1  # un de plus : savoir s'il reste une page
+        key = (query, match_all)
+        cache = self._get_result_cache()
+        entry = cache.get(key, self._index_signature)
+        if entry is not None and entry.covers(needed) and (entry.total is not None or not count):
+            searcher, ranked, total = entry.searcher, entry.ranked, entry.total
+        else:
+            try:
+                searcher = self.index.searcher()
+            except Exception as exc:
+                raise IndexAccessError(f"Index indisponible '{self.index_path}': {exc}") from exc
+            parsed = self._parse_query(query, conjunction=match_all)
+            known_total = entry.total if entry is not None else None
+            run_count = count and known_total is None
+            try:
+                results = searcher.search(parsed, needed, count=run_count)
+            except Exception as exc:
+                raise IndexAccessError(f"Recherche impossible sur '{self.index_path}': {exc}") from exc
+            ranked = list(results.hits if hasattr(results, "hits") else results)
+            if run_count:
+                total = getattr(results, "count", None)
+                if total is None:
+                    total = len(ranked)
+            else:
+                total = known_total
+            cache.put(key, CachedRanking(
+                searcher=searcher,
+                ranked=ranked,
+                total=total,
+                exhausted=len(ranked) < needed,
+                signature=self._index_signature,
+            ))
 
-        parsed = self._parse_query(query)
+        window = ranked[offset:offset + limit]
+        relaxable = bool(match_all and offset == 0 and not window and self._can_relax(query))
+        return HitPage(
+            searcher=searcher,
+            hits=window,
+            total=total,
+            has_more=len(ranked) > offset + limit,
+            relaxable=relaxable,
+        )
 
-        try:
-            results = searcher.search(parsed, limit + offset)
-        except Exception as exc:
-            raise IndexAccessError(f"Recherche impossible sur '{self.index_path}': {exc}") from exc
-        raw_hits = results.hits if hasattr(results, "hits") else results
+    def read_hits(self, searcher, ranked: list) -> list[dict | None]:
+        """Lit les documents d'un classement, None pour un document illisible.
 
-        hits = []
-        page = raw_hits[offset:]
+        Un document illisible ne condamne pas l'index entier : il est saute.
+        Si aucun ne se lit, l'index est vraiment inaccessible.
+        """
+        hits: list[dict | None] = []
         read_errors: list[Exception] = []
-        for score, doc_address in page:
+        for score, doc_address in ranked:
             try:
                 doc = searcher.doc(doc_address)
             except Exception as exc:
-                # Un document illisible ne condamne pas l'index entier : il est
-                # saute. Si aucun ne se lit, l'index est vraiment inaccessible.
                 read_errors.append(exc)
+                hits.append(None)
                 continue
             # Fallback: si content_raw est absent (ancien index sans index_raw_content=true),
             # on utilise content (version sanitisee). Les snippets seront moins fideles
             # au contenu original mais restent exploitables.
             raw = doc.get_first("content_raw") or doc.get_first("content") or ""
-            hit = {
+            hits.append({
                 "score": score,
                 "source": doc.get_first("source"),
                 "filename": doc.get_first("filename"),
                 "type": doc.get_first("type"),
                 "content_raw": raw,
-            }
-            hits.append(hit)
+            })
 
         if read_errors:
-            if not hits:
+            readable = len(ranked) - len(read_errors)
+            if readable == 0:
                 raise IndexAccessError(
                     f"Lecture resultats impossible sur '{self.index_path}': {read_errors[0]}"
                 ) from read_errors[0]
             logger.warning(
                 "%s resultat(s) illisible(s) ignore(s) sur '%s' (%s/%s lus): %s",
-                len(read_errors), self.index_path, len(hits), len(page), read_errors[0],
+                len(read_errors), self.index_path, readable, len(ranked), read_errors[0],
             )
+        return hits
 
+    def search(
+        self,
+        query: str,
+        limit: int = 20,
+        offset: int = 0,
+        *,
+        match_all: bool = True,
+        count: bool = True,
+    ) -> dict:
+        page = self.find(query, limit, offset, match_all=match_all, count=count)
+        hits = [hit for hit in self.read_hits(page.searcher, page.hits) if hit is not None]
         return {
             "query": query,
-            "total": results.count if hasattr(results, "count") else len(raw_hits),
+            "total": page.total,
             "limit": limit,
             "offset": offset,
             "hits": hits,
+            "has_more": page.has_more,
+            "relaxable": page.relaxable,
         }
 
     def _refresh_index_size_background(self):

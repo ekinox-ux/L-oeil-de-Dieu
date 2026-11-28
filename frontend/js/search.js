@@ -23,6 +23,7 @@
     var heroIndexStatus = document.getElementById('hero-index-status');
     var headerSystemStatus = document.getElementById('header-system-status');
     var LIMIT = SearchApi.defaultLimit;
+    var ALL_INDEXES = SearchApi.allIndexesId;
 
     var state = {
         currentIndexId: null,
@@ -31,7 +32,16 @@
         isSearching: false,
         indexesLoadedOnce: false,
         backendDegraded: false,
-        hasKpiData: false
+        hasKpiData: false,
+        // Recherche en cours de pagination : les pages suivantes gardent
+        // l'index, le mode (tous les mots / au moins un) et le total de la
+        // page 1, que l'API ne recompte plus.
+        searchIndexId: null,
+        matchMode: null,
+        searchTotal: null,
+        searchTotalPages: null,
+        relaxed: false,
+        skippedIndexes: []
     };
 
     var toastTimer = null;
@@ -274,8 +284,19 @@
                     indexSelect.appendChild(opt);
                 });
 
+                // Plusieurs index prets : une recherche peut les interroger tous.
+                if (readyIndexes.length >= 2) {
+                    var allOpt = document.createElement('option');
+                    allOpt.value = ALL_INDEXES;
+                    allOpt.textContent = 'Tous les index';
+                    indexSelect.insertBefore(allOpt, indexSelect.firstChild);
+                    if (previousId === ALL_INDEXES) {
+                        state.currentIndexId = ALL_INDEXES;
+                    }
+                }
+
                 // Selectionner le premier index ready (ou restaurer la selection precedente)
-                for (var j = 0; j < idxList.length; j++) {
+                for (var j = 0; j < idxList.length && state.currentIndexId !== ALL_INDEXES; j++) {
                     if (idxList[j].status === 'ready') {
                         if (previousId && idxList[j].id === previousId) {
                             state.currentIndexId = previousId;
@@ -353,6 +374,26 @@
         });
     }
 
+    function renderNotice(data) {
+        var existing = document.getElementById('results-notice');
+        if (existing) existing.remove();
+        var messages = [];
+        if (data.relaxed) {
+            messages.push('Aucun resultat ne contient tous les mots : voici ceux qui en contiennent au moins un.');
+        }
+        if (data.skipped_indexes && data.skipped_indexes.length) {
+            var names = data.skipped_indexes.map(function (item) { return item.name || item.id; });
+            messages.push('Index ignores (erreur ou delai depasse) : ' + names.join(', ') + '. Le total est un minimum.');
+        }
+        if (!messages.length) return;
+        var notice = document.createElement('div');
+        notice.id = 'results-notice';
+        notice.className = 'results-notice';
+        notice.setAttribute('role', 'status');
+        notice.textContent = messages.join(' ');
+        resultsList.parentElement.insertBefore(notice, resultsList);
+    }
+
     function renderPagination(data, offset) {
         var existing = document.getElementById('pagination');
         if (existing) existing.remove();
@@ -370,7 +411,7 @@
         btnPrev.textContent = '<- Precedent';
         btnPrev.disabled = offset === 0;
         btnPrev.addEventListener('click', function () {
-            performSearch(state.currentQuery, Math.max(0, offset - LIMIT));
+            performSearch(state.currentQuery, Math.max(0, offset - LIMIT), true);
             window.scrollTo({ top: 0, behavior: 'smooth' });
         });
 
@@ -383,7 +424,7 @@
         btnNext.textContent = 'Suivant ->';
         btnNext.disabled = !hasMore;
         btnNext.addEventListener('click', function () {
-            performSearch(state.currentQuery, offset + LIMIT);
+            performSearch(state.currentQuery, offset + LIMIT, true);
             window.scrollTo({ top: 0, behavior: 'smooth' });
         });
 
@@ -405,6 +446,7 @@
         resultsCount.textContent = data.total + label + (totalPages > 1 ? ' - page ' + page + '/' + totalPages : '');
         resultsTime.textContent = data._elapsed || '';
         searchInputHeader.value = query;
+        renderNotice(data);
         renderPagination(data, offset);
     }
 
@@ -427,19 +469,46 @@
         searchInput.focus();
     }
 
-    function performSearch(query, offset) {
+    /**
+     * paginate : page d'une recherche deja lancee. Elle reprend l'index, le
+     * mode et le total de la page 1 (count=false : l'API ne recompte pas).
+     */
+    function performSearch(query, offset, paginate) {
         if (!query.trim() || state.isSearching) return;
         if (offset === undefined) offset = 0;
+        paginate = Boolean(paginate) && query === state.currentQuery && state.matchMode !== null;
 
         setSearchLoading(true);
         state.currentQuery = query;
         state.currentOffset = offset;
 
+        var indexId = paginate ? state.searchIndexId : state.currentIndexId;
+        var options = {};
+        if (paginate) {
+            options.match = state.matchMode;
+            options.count = state.searchTotal === null;
+        }
+
         var startTime = performance.now();
-        SearchApi.search(query, offset, state.currentIndexId)
+        SearchApi.search(query, offset, indexId, options)
             .then(function (data) {
                 var elapsed = ((performance.now() - startTime) / 1000).toFixed(3);
                 data._elapsed = elapsed + 's';
+                if (paginate) {
+                    if (data.total === null || data.total === undefined) {
+                        data.total = state.searchTotal;
+                        data.total_pages = state.searchTotalPages;
+                    }
+                    data.relaxed = state.relaxed;
+                } else {
+                    state.searchIndexId = indexId;
+                    state.relaxed = Boolean(data.relaxed);
+                }
+                state.matchMode = data.match_mode || 'all';
+                if (data.total !== null && data.total !== undefined) {
+                    state.searchTotal = data.total;
+                    state.searchTotalPages = data.total_pages;
+                }
                 setSearchLoading(false);
                 showResults(query, data, offset);
             })

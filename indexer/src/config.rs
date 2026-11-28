@@ -24,6 +24,11 @@ pub struct Config {
     pub use_stemming: bool,
     #[serde(default = "default_use_stop_words")]
     pub use_stop_words: bool,
+    /// Ignore les accents (Hélène = helene). Absent : active pour un nouvel
+    /// index, valeur de l'index pour un index existant (absente = false, les
+    /// index construits avant l'option gardent leurs accents).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ascii_folding: Option<bool>,
     #[serde(default = "default_commit_frequency")]
     pub commit_every_n_docs: usize,
     #[serde(default = "default_writer_threads")]
@@ -141,6 +146,7 @@ impl Default for Config {
             language: default_language(),
             use_stemming: default_use_stemming(),
             use_stop_words: default_use_stop_words(),
+            ascii_folding: None,
             commit_every_n_docs: default_commit_frequency(),
             writer_threads: default_writer_threads(),
             reader_threads: default_reader_threads(),
@@ -210,9 +216,30 @@ impl Config {
 
     pub fn schema_hash(&self) -> String {
         format!(
-            "raw:{}_lang:{}_stem:{}_stop:{}",
-            self.index_raw_content, self.language, self.use_stemming, self.use_stop_words,
+            "raw:{}_lang:{}_stem:{}_stop:{}_fold:{}",
+            self.index_raw_content,
+            self.language,
+            self.use_stemming,
+            self.use_stop_words,
+            self.ascii_folding_enabled(),
         )
+    }
+
+    /// Accents ignores par le tokenizer. Une config d'index sans la cle date
+    /// d'avant l'option : son index garde les accents.
+    pub fn ascii_folding_enabled(&self) -> bool {
+        self.ascii_folding.unwrap_or(false)
+    }
+
+    /// Fixe ascii_folding quand la config ne le precise pas : un index
+    /// existant garde son reglage, un nouvel index ignore les accents.
+    pub fn resolve_ascii_folding(&mut self, existing: Option<&Config>, index_exists: bool) {
+        if self.ascii_folding.is_none() {
+            self.ascii_folding = Some(match existing {
+                Some(existing) => existing.ascii_folding_enabled(),
+                None => !index_exists,
+            });
+        }
     }
 
     /// Reglages du doc store pour un index cree avec cette config.
@@ -376,7 +403,53 @@ language = \"en\"
             use_stemming: true,
             ..Config::default()
         };
-        assert_eq!(cfg.schema_hash(), "raw:true_lang:fr_stem:true_stop:false");
+        assert_eq!(
+            cfg.schema_hash(),
+            "raw:true_lang:fr_stem:true_stop:false_fold:false"
+        );
+    }
+
+    #[test]
+    fn ascii_folding_defaults_on_for_new_indexes_only() {
+        let mut new_index = Config::default();
+        new_index.resolve_ascii_folding(None, false);
+        assert_eq!(new_index.ascii_folding, Some(true));
+
+        // Index construit avant l'option : config sans la cle.
+        let legacy: Config = toml::from_str("language = \"en\"\n").unwrap();
+        assert_eq!(legacy.ascii_folding, None);
+        assert!(!legacy.ascii_folding_enabled());
+        let mut existing = Config::default();
+        existing.resolve_ascii_folding(Some(&legacy), true);
+        assert_eq!(existing.ascii_folding, Some(false));
+
+        // Index existant sans .schema_config.toml : accents conserves.
+        let mut unknown = Config::default();
+        unknown.resolve_ascii_folding(None, true);
+        assert_eq!(unknown.ascii_folding, Some(false));
+
+        // Un choix explicite n'est jamais remplace.
+        let mut explicit = Config {
+            ascii_folding: Some(true),
+            ..Config::default()
+        };
+        explicit.resolve_ascii_folding(Some(&legacy), true);
+        assert_eq!(explicit.ascii_folding, Some(true));
+    }
+
+    #[test]
+    fn ascii_folding_is_saved_with_the_index() {
+        let dir = temp_dir("oeil_cfg_fold");
+        let cfg = Config {
+            ascii_folding: Some(true),
+            ..Config::default()
+        };
+
+        cfg.save_to_index(&dir).unwrap();
+        let loaded = Config::load_from_index(&dir).unwrap().unwrap();
+
+        assert_eq!(loaded.ascii_folding, Some(true));
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

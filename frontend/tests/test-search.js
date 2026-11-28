@@ -755,3 +755,135 @@ pendingTests++;
     dom.window.close();
     testDone();
 })();
+
+// ---- Pertinence : mode et total repris par la pagination, tous les index ----
+
+function recordingFetch(indexes, pages, urls) {
+    return function (url) {
+        if (url.indexOf('/api/indexes') !== -1) {
+            return Promise.resolve({ ok: true, json: function () { return Promise.resolve(indexes); } });
+        }
+        if (url.indexOf('/api/stats') !== -1) {
+            return Promise.resolve({ ok: true, json: function () { return Promise.resolve({ total_docs: 1, num_segments: 1, index_size: '1 Ko' }); } });
+        }
+        urls.push(url);
+        var payload = pages[Math.min(urls.length - 1, pages.length - 1)];
+        return Promise.resolve({ ok: true, json: function () { return Promise.resolve(payload); } });
+    };
+}
+
+// La page 2 reprend le mode de la page 1 et ne recompte pas le total.
+pendingTests++;
+(function testPaginationReusesModeAndTotal() {
+    var urls = [];
+    var hit = { score: 1, source: 'C:/data/ACME/f.jsonl', type: 'record', snippets: [] };
+    var dom = loadWithSearch(recordingFetch([{ id: 'test', name: 'Test', status: 'ready' }], [
+        { query: 'jean lyon', total: 45, limit: 20, offset: 0, has_more: true, total_pages: 3,
+          match_mode: 'any', relaxed: true, hits: [hit] },
+        { query: 'jean lyon', total: null, limit: 20, offset: 20, has_more: true, total_pages: null,
+          match_mode: 'any', relaxed: false, hits: [hit] }
+    ], urls));
+    var doc = dom.window.document;
+
+    waitFor(
+        function () { return doc.getElementById('index-select').value === 'test'; },
+        'pagination mode: index loaded',
+        function () {
+            triggerSearch(dom, 'jean lyon');
+            waitFor(
+                function () { return doc.getElementById('pagination') !== null; },
+                'pagination mode: first page rendered',
+                function () {
+                    assert(urls[0].indexOf('match=') === -1, 'first page: auto mode (no match param)');
+                    assert(urls[0].indexOf('count=false') === -1, 'first page: total counted');
+                    var notice = doc.getElementById('results-notice');
+                    assert(notice && notice.textContent.indexOf('au moins un') !== -1, 'relaxed notice shown');
+
+                    doc.getElementById('pagination').querySelectorAll('.pagination-btn')[1].click();
+                    waitFor(
+                        function () { return doc.getElementById('results-count').textContent.indexOf('page 2/3') !== -1; },
+                        'pagination mode: second page rendered',
+                        function () {
+                            assert(urls[1].indexOf('&match=any') !== -1, 'second page: keeps match mode');
+                            assert(urls[1].indexOf('&count=false') !== -1, 'second page: total not recounted');
+                            assert(urls[1].indexOf('&index=test') !== -1, 'second page: same index');
+                            assert(doc.getElementById('results-count').textContent.indexOf('45 resultats') !== -1,
+                                'second page: total from first page');
+                            assert(doc.getElementById('results-notice') !== null, 'relaxed notice kept on page 2');
+                            dom.window.close();
+                            testDone();
+                        }
+                    );
+                }
+            );
+        }
+    );
+})();
+
+// Plusieurs index prets : option "Tous les index", origine de chaque resultat.
+pendingTests++;
+(function testAllIndexesOption() {
+    var urls = [];
+    var dom = loadWithSearch(recordingFetch([
+        { id: 'a', name: 'Fuite A', status: 'ready' },
+        { id: 'b', name: 'Fuite B', status: 'ready' }
+    ], [
+        { query: 'alice', total: 2, limit: 20, offset: 0, has_more: false, total_pages: 1,
+          match_mode: 'all', relaxed: false, partial: true,
+          skipped_indexes: [{ id: 'b', name: 'Fuite B', reason: 'timeout' }],
+          hits: [{ score: 2, source: 'C:/data/ACME/f.jsonl', type: 'record', index_name: 'Fuite A', snippets: [] }] }
+    ], urls));
+    var doc = dom.window.document;
+    var select = doc.getElementById('index-select');
+
+    waitFor(
+        function () { return select.options.length === 3; },
+        'all indexes: options loaded',
+        function () {
+            assertEqual(select.options[0].value, 'all', 'all indexes option listed first');
+            assertEqual(select.options[0].textContent, 'Tous les index', 'all indexes option label');
+            select.value = 'all';
+            select.dispatchEvent(new dom.window.Event('change'));
+            triggerSearch(dom, 'alice');
+            waitFor(
+                function () { return doc.getElementById('results-list').querySelectorAll('.result-card').length > 0; },
+                'all indexes: results rendered',
+                function () {
+                    assert(urls[0].indexOf('&index=all') !== -1, 'search sent to all indexes');
+                    var badge = doc.querySelector('.result-card .card-index');
+                    assert(badge && badge.textContent === 'Fuite A', 'card shows source index');
+                    var notice = doc.getElementById('results-notice');
+                    assert(notice && notice.textContent.indexOf('Fuite B') !== -1, 'skipped index reported');
+                    dom.window.close();
+                    testDone();
+                }
+            );
+        }
+    );
+})();
+
+// Un seul index pret : pas d'option "Tous les index", pas de badge.
+pendingTests++;
+(function testSingleIndexHasNoAllOption() {
+    var dom = loadWithSearch(recordingFetch([
+        { id: 'a', name: 'Fuite A', status: 'ready' },
+        { id: 'b', name: 'Fuite B', status: 'loading' }
+    ], [{}], []));
+    var doc = dom.window.document;
+    var select = doc.getElementById('index-select');
+
+    waitFor(
+        function () { return select.options.length === 2; },
+        'single ready index: options loaded',
+        function () {
+            var values = Array.prototype.map.call(select.options, function (o) { return o.value; });
+            assert(values.indexOf('all') === -1, 'no all option with one ready index');
+            var card = dom.window.SearchComponents.renderCard({ score: 1, source: 'C:/x/y.jsonl', snippets: [] }, 0, 'x');
+            assertEqual(card.querySelector('.card-index'), null, 'no index badge without index_name');
+            var url = dom.window.SearchApi.buildSearchUrl('a b', 0, 'a', { match: 'bogus', count: true });
+            assert(url.indexOf('match=') === -1 && url.indexOf('count=') === -1, 'buildSearchUrl ignores defaults');
+            dom.window.close();
+            testDone();
+        }
+    );
+})();

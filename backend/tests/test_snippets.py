@@ -37,3 +37,10 @@ def test_extract_snippets_limits_overlapping_ranges():
     snippets = extract_snippets(text, 'alpha', context_chars=8, max_snippets=5)
     assert len(snippets) >= 1
     assert len(snippets) <= 2
+
+
+def test_extract_snippets_previews_filter_only_queries():
+    # filename:, source: ou exclusions seules : rien a surligner, mais le
+    # document trouve reste lisible.
+    for query in ("filename:fuite", "source:x", "-bob"):
+        assert extract_snippets("alpha beta gamma", query) == [{"text": "alpha beta gamma", "highlights": []}]

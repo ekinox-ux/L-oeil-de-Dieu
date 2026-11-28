@@ -1,13 +1,26 @@
 import re
 
-from query_terms import highlight_patterns
+from query_terms import has_search_terms, highlight_patterns
 from settings import MAX_QUERY_LENGTH
 
 
 MAX_CONTENT_SIZE = 512_000  # 500 Ko
 
 
-def extract_snippets(raw_content: str, query: str, context_chars: int = 2500, max_snippets: int = 5) -> list[dict]:
+def _preview(raw_content: str, context_chars: int) -> list[dict]:
+    preview = raw_content[:context_chars * 2].strip()
+    if preview:
+        return [{"text": preview, "highlights": []}]
+    return []
+
+
+def extract_snippets(
+    raw_content: str,
+    query: str,
+    context_chars: int = 2500,
+    max_snippets: int = 5,
+    fold_accents: bool = False,
+) -> list[dict]:
     """Extrait des snippets du contenu brut avec contexte autour des termes recherches.
 
     Retourne une liste de dicts: {"text": str, "highlights": [(start, end), ...]}
@@ -16,7 +29,8 @@ def extract_snippets(raw_content: str, query: str, context_chars: int = 2500, ma
     surligne `jose_martin@example.com`, que la recherche a trouve. Si aucune
     unite n'apparait telle quelle (phrase coupee par une cle JSON dans le
     contenu brut), les tokens sont surlignes un par un. Les positions sont en
-    caracteres (points de code).
+    caracteres (points de code). fold_accents suit l'index : construit avec
+    ascii_folding, `helene` y a trouve `Hélène`, qui est donc surligne.
     """
     if not raw_content or not query:
         return []
@@ -28,9 +42,11 @@ def extract_snippets(raw_content: str, query: str, context_chars: int = 2500, ma
     if len(raw_content) > MAX_CONTENT_SIZE:
         raw_content = raw_content[:MAX_CONTENT_SIZE]
 
-    unit_patterns, token_patterns = highlight_patterns(query)
+    unit_patterns, token_patterns = highlight_patterns(query, fold=fold_accents)
     if not unit_patterns:
-        return []
+        # Recherche sur le nom du fichier, la source ou par exclusions : rien a
+        # surligner, le debut du document reste affiche.
+        return _preview(raw_content, context_chars) if has_search_terms(query) else []
 
     matches = []
     for patterns in (unit_patterns, token_patterns):
@@ -47,10 +63,7 @@ def extract_snippets(raw_content: str, query: str, context_chars: int = 2500, ma
 
     if not matches:
         # Fallback: retourner le debut du contenu
-        preview = raw_content[:context_chars * 2].strip()
-        if preview:
-            return [{"text": preview, "highlights": []}]
-        return []
+        return _preview(raw_content, context_chars)
 
     # Regrouper les matches proches et extraire les snippets
     snippets = []

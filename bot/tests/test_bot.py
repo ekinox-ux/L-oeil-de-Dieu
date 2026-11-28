@@ -1259,3 +1259,74 @@ def test_cmd_search_disables_timeout_retry_and_asks_short_context(bot_module, mo
     assert seen['kw'].get('retry_on_timeout') is False
     assert seen['params']['context'] == bot_module.SEARCH_CONTEXT_CHARS
     assert seen['params']['context'] < 2500
+
+
+# ---- pertinence : mode et total repris par la pagination, tous les index ----
+
+def _bot_hits(first, count, **extra):
+    return [
+        {'source': f'C:\\data\\co{i}\\f.jsonl', 'type': 'record', 'score': 1.0,
+         'snippets': [{'text': 'x' * 2000, 'highlights': [[0, 1]]}], **extra}
+        for i in range(first, first + count)
+    ]
+
+
+def test_next_page_keeps_match_mode_and_skips_the_count(bot_module, monkeypatch):
+    calls = []
+
+    async def fake_api_get(endpoint, params=None, **kwargs):
+        calls.append(params)
+        return {'total': None, 'total_pages': None, 'hits': _bot_hits(5, 5), 'match_mode': 'any'}
+
+    monkeypatch.setattr(bot_module, 'api_get', fake_api_get)
+    view = bot_module.SearchPaginator(
+        query='jean lyon', hits=_bot_hits(0, 5), total=12, user_id=1,
+        result_limit=12, match_mode='any', relaxed=True,
+    )
+    view.message = FakeMessage()
+
+    asyncio.run(view.btn_next.callback(FakeInteraction()))
+
+    assert calls[0]['match'] == 'any'
+    assert calls[0]['count'] == 'false'
+    assert view.total == 12  # total de la page 1 garde
+    assert 'page 2/3' in view.message.edited_embed.footer.text
+
+
+def test_relaxed_search_says_so_and_fits_the_embed(bot_module):
+    view = bot_module.SearchPaginator(
+        query='jean lyon', hits=_bot_hits(0, 5), total=5, user_id=1, relaxed=True,
+    )
+
+    description = view.build_embed().description
+
+    assert description.startswith(bot_module.RELAXED_NOTICE)
+    assert len(description) <= bot_module.EMBED_DESCRIPTION_LIMIT
+    assert description.count('```') % 2 == 0
+
+
+def test_all_indexes_hits_show_their_index_and_skipped_ones(bot_module):
+    view = bot_module.SearchPaginator(
+        query='alice', hits=_bot_hits(0, 2, index_name='Fuite A'), total=2, user_id=1,
+        skipped_indexes=[{'id': 'b', 'name': 'Fuite B', 'reason': 'timeout'}],
+    )
+
+    embed = view.build_embed()
+
+    assert '[Fuite A]' in embed.description
+    assert 'Fuite B' in embed.footer.text
+
+
+def test_cmd_search_passes_mode_and_relaxed_to_the_paginator(bot_module, monkeypatch):
+    async def spy_api_get(endpoint, params=None, **kw):
+        return {'total': 3, 'hits': _bot_hits(0, 3), 'query': 'jean lyon',
+                'match_mode': 'any', 'relaxed': True}
+
+    monkeypatch.setattr(bot_module, 'api_get', spy_api_get)
+    interaction = FakeInteraction()
+
+    asyncio.run(bot_module.cmd_search.callback(interaction, query='jean lyon', limit=20, index='all'))
+
+    embed = interaction.followup.sent[0]['embed']
+    assert embed.description.startswith(bot_module.RELAXED_NOTICE)
+    assert interaction.followup.sent[0]['kwargs']['view'].match_mode == 'any'

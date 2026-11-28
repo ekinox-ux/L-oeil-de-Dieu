@@ -36,10 +36,22 @@
         return API_BASE + '/api/indexes';
     }
 
-    function buildSearchUrl(query, offset, indexId) {
+    /**
+     * options.match : 'all' ou 'any' pour reprendre le mode de la page 1
+     *   (absent : 'auto', tous les mots puis au moins un si rien n'est trouve).
+     * options.count : false sur les pages suivantes, le total est deja connu.
+     */
+    function buildSearchUrl(query, offset, indexId, options) {
+        options = options || {};
         var url = API_BASE + '/api/search?q=' + encodeURIComponent(query) + '&limit=' + LIMIT + '&offset=' + offset + '&context=' + CONTEXT_SIZE;
         if (indexId) {
             url += '&index=' + encodeURIComponent(indexId);
+        }
+        if (options.match === 'all' || options.match === 'any') {
+            url += '&match=' + options.match;
+        }
+        if (options.count === false) {
+            url += '&count=false';
         }
         return url;
     }
@@ -52,8 +64,8 @@
         return fetchJson(buildStatsUrl(indexId));
     }
 
-    function search(query, offset, indexId) {
-        return fetchJson(buildSearchUrl(query, offset, indexId), { timeoutMs: SEARCH_TIMEOUT_MS });
+    function search(query, offset, indexId, options) {
+        return fetchJson(buildSearchUrl(query, offset, indexId, options), { timeoutMs: SEARCH_TIMEOUT_MS });
     }
 
     function fetchBreaches(email) {
@@ -71,6 +83,8 @@
 
     window.SearchApi = {
         defaultLimit: LIMIT,
+        allIndexesId: 'all',
+        buildSearchUrl: buildSearchUrl,
         searchTimeoutMs: SEARCH_TIMEOUT_MS,
         loadIndexes: loadIndexes,
         loadStats: loadStats,

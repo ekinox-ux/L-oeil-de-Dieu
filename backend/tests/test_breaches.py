@@ -19,7 +19,7 @@ from services.breach_lookup import (
 
 
 class DummyEngine:
-    def search(self, query, limit=20, offset=0):
+    def search(self, query, limit=20, offset=0, **_kwargs):
         return {"query": query, "total": 0, "limit": limit, "offset": offset, "hits": []}
 
     def stats(self):

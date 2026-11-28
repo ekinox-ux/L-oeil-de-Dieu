@@ -67,6 +67,17 @@ MAX_TOP_EMAILS = _get_int("OEIL_MAX_TOP_EMAILS", 100)
 MAX_TOP_PHONES = _get_int("OEIL_MAX_TOP_PHONES", 50)
 MAX_TOP_DOMAINS = _get_int("OEIL_MAX_TOP_DOMAINS", 30)
 
+# -- Cache des recherches --
+# Classements (scores et adresses des documents, jamais le contenu) gardes en
+# memoire par index : la page suivante ou precedente ne relance pas Tantivy.
+# Vide des que l'index change ; 0 entree desactive le cache.
+SEARCH_CACHE_ENTRIES = max(0, _get_int("OEIL_SEARCH_CACHE_ENTRIES", 32))
+SEARCH_CACHE_TTL_SECONDS = max(0, _get_int("OEIL_SEARCH_CACHE_TTL_SECONDS", 300))
+# Recherche sur tous les index : un index qui ne repond pas dans ce delai est
+# ignore (resultats partiels signales), sous le timeout de 180 s des clients.
+ALL_INDEXES_SEARCH_TIMEOUT_SECONDS = max(1, _get_int("OEIL_ALL_INDEXES_SEARCH_TIMEOUT_SECONDS", 150))
+ALL_INDEXES_SEARCH_WORKERS = max(1, _get_int("OEIL_ALL_INDEXES_SEARCH_WORKERS", 8))
+
 # -- Ouverture des index --
 # Un lock Tantivy ne peut pas etre declare orphelin de facon fiable a partir
 # de son age. Le supprimer pendant qu'un writer est vivant peut endommager

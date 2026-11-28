@@ -6,7 +6,8 @@ use tantivy::schema::{
     Field, IndexRecordOption, Schema, TextFieldIndexing, TextOptions, STORED, STRING,
 };
 use tantivy::tokenizer::{
-    Language, LowerCaser, RemoveLongFilter, SimpleTokenizer, Stemmer, StopWordFilter, TextAnalyzer,
+    AsciiFoldingFilter, Language, LowerCaser, RemoveLongFilter, SimpleTokenizer, Stemmer,
+    StopWordFilter, TextAnalyzer,
 };
 use tantivy::Index;
 
@@ -150,28 +151,34 @@ fn parse_language(lang: &str) -> Language {
 pub fn register_tokenizer(index: &Index, config: &Config) -> Result<()> {
     let language = parse_language(&config.language);
     let limit = config.max_word_length;
+    let stop_words = || StopWordFilter::new(language).expect("Stop words indisponibles");
 
-    let analyzer = match (config.use_stemming, config.use_stop_words) {
-        (true, true) => TextAnalyzer::builder(SimpleTokenizer::default())
-            .filter(RemoveLongFilter::limit(limit))
-            .filter(LowerCaser)
-            .filter(Stemmer::new(language))
-            .filter(StopWordFilter::new(language).expect("Stop words indisponibles"))
-            .build(),
-        (true, false) => TextAnalyzer::builder(SimpleTokenizer::default())
-            .filter(RemoveLongFilter::limit(limit))
-            .filter(LowerCaser)
-            .filter(Stemmer::new(language))
-            .build(),
-        (false, true) => TextAnalyzer::builder(SimpleTokenizer::default())
-            .filter(RemoveLongFilter::limit(limit))
-            .filter(LowerCaser)
-            .filter(StopWordFilter::new(language).expect("Stop words indisponibles"))
-            .build(),
-        (false, false) => TextAnalyzer::builder(SimpleTokenizer::default())
-            .filter(RemoveLongFilter::limit(limit))
-            .filter(LowerCaser)
-            .build(),
+    // Filtres dans un ordre fixe, repris par le backend (engine.py) :
+    // remove_long, lowercase, stemmer, stop words, ascii folding. L'analyseur
+    // reste statique (pas de `dynamic()`, plus lent a l'indexation).
+    macro_rules! analyzer {
+        ($($filter:expr),* $(,)?) => {
+            TextAnalyzer::builder(SimpleTokenizer::default())
+                .filter(RemoveLongFilter::limit(limit))
+                .filter(LowerCaser)
+                $(.filter($filter))*
+                .build()
+        };
+    }
+
+    let analyzer = match (
+        config.use_stemming,
+        config.use_stop_words,
+        config.ascii_folding_enabled(),
+    ) {
+        (true, true, true) => analyzer!(Stemmer::new(language), stop_words(), AsciiFoldingFilter),
+        (true, true, false) => analyzer!(Stemmer::new(language), stop_words()),
+        (true, false, true) => analyzer!(Stemmer::new(language), AsciiFoldingFilter),
+        (true, false, false) => analyzer!(Stemmer::new(language)),
+        (false, true, true) => analyzer!(stop_words(), AsciiFoldingFilter),
+        (false, true, false) => analyzer!(stop_words()),
+        (false, false, true) => analyzer!(AsciiFoldingFilter),
+        (false, false, false) => analyzer!(),
     };
 
     index.tokenizers().register("custom_tech", analyzer);
@@ -316,6 +323,46 @@ mod tests {
     fn open_existing_index_rejects_empty_directory() {
         let dir = temp_dir("oeil_no_index");
         assert!(open_existing_index(&dir).is_err());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    fn tokens(index: &Index, text: &str) -> Vec<String> {
+        let mut analyzer = index.tokenizers().get("custom_tech").unwrap();
+        let mut stream = analyzer.token_stream(text);
+        let mut out = Vec::new();
+        while stream.advance() {
+            out.push(stream.token().text.clone());
+        }
+        out
+    }
+
+    #[test]
+    fn ascii_folding_removes_accents_only_when_enabled() {
+        let dir = temp_dir("oeil_fold_tokens");
+        let (index, _) = open_or_create_index(&dir, &Config::default()).unwrap();
+        let folding = Config {
+            ascii_folding: Some(true),
+            ..Config::default()
+        };
+
+        register_tokenizer(&index, &Config::default()).unwrap();
+        assert_eq!(tokens(&index, "Hélène Strauß"), ["hélène", "strauß"]);
+        register_tokenizer(&index, &folding).unwrap();
+        assert_eq!(
+            tokens(&index, "Hélène Strauß Œuvre"),
+            ["helene", "strauss", "oeuvre"]
+        );
+
+        let stemming = Config {
+            use_stemming: true,
+            use_stop_words: true,
+            language: "fr".to_string(),
+            ..folding
+        };
+        register_tokenizer(&index, &stemming).unwrap();
+        // Racine francaise puis accents retires (élégantes -> élég -> eleg).
+        assert_eq!(tokens(&index, "Élégantes"), ["eleg"]);
+        drop(index);
         fs::remove_dir_all(dir).unwrap();
     }
 

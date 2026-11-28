@@ -7,7 +7,8 @@
  *
  * - Donnees d'entree (hit):
  *     { score: number, source: string|null, filename: string|null,
- *       type: string|null, snippets: Array<{text: string, highlights: Array<[start,end]>}> }
+ *       type: string|null, index_name: string|null (recherche sur tous les index),
+ *       snippets: Array<{text: string, highlights: Array<[start,end]>}> }
  *   Tous les champs optionnels peuvent etre null/undefined — les fonctions
  *   utilisent des fallbacks ("", 0, []) plutot que d'echouer.
  *
@@ -370,6 +371,13 @@
 
         card.appendChild(header);
         card.appendChild(typeSpan);
+        if (hit.index_name) {
+            // Recherche sur tous les index : de quelle fuite vient le resultat.
+            var indexSpan = document.createElement('span');
+            indexSpan.className = 'card-type card-index';
+            indexSpan.textContent = hit.index_name;
+            card.appendChild(indexSpan);
+        }
         card.appendChild(snippetDiv);
         if (snippetHtml) {
             card.appendChild(expandHint);
