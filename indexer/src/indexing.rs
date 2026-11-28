@@ -22,6 +22,9 @@ use crate::sanitize::{flatten_json_values, sanitize_content};
 use crate::schema::{open_existing_index, open_or_create_index, IndexFields};
 
 const MAX_ERROR_LOGS: usize = 50;
+/// Erreurs de ligne detaillees par fichier; les suivantes sont seulement
+/// comptees dans le bilan du fichier.
+const MAX_LINE_ERRORS_PER_FILE: usize = 3;
 /// Au-dela, la fin d'indexation suggere la commande `merge`.
 const SEGMENT_HINT_THRESHOLD: usize = 64;
 
@@ -51,14 +54,13 @@ struct SourceFingerprint {
     sample_hash: u64,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug)]
 struct PreparedDocument {
     filename: String,
     doc_type: String,
     /// Valeurs aplaties: texte indexe (champ `content`).
     content: String,
     /// Document JSON compact, cles comprises: texte des snippets (`content_raw`).
-    #[serde(default, skip_serializing_if = "String::is_empty")]
     raw: String,
 }
 
@@ -76,6 +78,8 @@ struct ProcessContext<'a> {
     doc_count: &'a AtomicUsize,
     error_count: &'a AtomicUsize,
     logged_errors: &'a AtomicUsize,
+    /// Lignes JSON invalides ou trop longues, ignorees sans ecarter le fichier.
+    skipped_lines: &'a AtomicUsize,
     /// Termes deja indexes pour ce fichier; vide si ce n'est pas un remplacement.
     replace_sources: &'a [String],
 }
@@ -185,6 +189,7 @@ pub fn run(
     let error_count = Arc::new(AtomicUsize::new(0));
     let logged_errors = Arc::new(AtomicUsize::new(0));
     let skipped_count = Arc::new(AtomicUsize::new(0));
+    let skipped_lines = Arc::new(AtomicUsize::new(0));
 
     // Thread producteur : lit les fichiers en parallele avec rayon
     let producer_handle = {
@@ -197,6 +202,7 @@ pub fn run(
         let error_count = error_count.clone();
         let logged_errors = logged_errors.clone();
         let skipped_count = skipped_count.clone();
+        let skipped_lines = skipped_lines.clone();
         let source_state = source_state.clone();
 
         std::thread::Builder::new()
@@ -262,9 +268,10 @@ pub fn run(
                                 doc_count: &doc_count,
                                 error_count: &error_count,
                                 logged_errors: &logged_errors,
+                                skipped_lines: &skipped_lines,
                                 replace_sources: if no_dedup { &[] } else { existing_terms },
                             };
-                            if process_file_transactional(file_path, &path_str, &context) {
+                            if process_file(file_path, &path_str, &context) {
                                 if let Ok(mut state) = source_state.lock() {
                                     state.insert(key.clone(), fingerprint);
                                 }
@@ -396,6 +403,7 @@ pub fn run(
         start.elapsed(),
         doc_count.load(Ordering::Relaxed),
         skipped_count.load(Ordering::Relaxed),
+        skipped_lines.load(Ordering::Relaxed),
         error_count.load(Ordering::Relaxed),
         &log_file_path,
     );
@@ -1201,23 +1209,85 @@ fn read_bounded_line<R: BufRead>(
     }
 }
 
-static STAGING_COUNTER: AtomicUsize = AtomicUsize::new(0);
+/// Bilan de lecture d'un fichier JSONL.
+#[derive(Debug, Default)]
+struct ScanReport {
+    /// Lignes JSON valides, documents vides compris.
+    valid_lines: usize,
+    invalid_json: usize,
+    oversized: usize,
+    /// Premieres erreurs de ligne, recopiees dans le journal.
+    first_errors: Vec<String>,
+}
 
-fn create_staging_file() -> io::Result<(PathBuf, BufWriter<File>)> {
-    for _ in 0..100 {
-        let id = STAGING_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let path =
-            std::env::temp_dir().join(format!("oeil-indexer-{}-{}.jsonl", std::process::id(), id,));
-        match OpenOptions::new().write(true).create_new(true).open(&path) {
-            Ok(file) => return Ok((path, BufWriter::new(file))),
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
-            Err(error) => return Err(error),
+impl ScanReport {
+    fn skipped_lines(&self) -> usize {
+        self.invalid_json + self.oversized
+    }
+
+    fn record_error(&mut self, message: String) {
+        if self.first_errors.len() < MAX_LINE_ERRORS_PER_FILE {
+            self.first_errors.push(message);
         }
     }
-    Err(io::Error::new(
-        io::ErrorKind::AlreadyExists,
-        "impossible de reserver un fichier temporaire unique",
-    ))
+}
+
+enum LineOutcome {
+    Valid,
+    Invalid(String),
+    /// Le writer ne recoit plus rien: inutile de lire la suite.
+    Stop,
+}
+
+enum ScanStop {
+    Interrupted,
+    Read(io::Error),
+    Consumer,
+}
+
+/// Lit un JSONL ligne par ligne et passe chaque ligne non vide, nettoyee de
+/// ses caracteres de controle, a `handle_line`. Une ligne trop longue ou
+/// invalide est comptee puis ignoree: elle ne fait pas ecarter le fichier.
+fn scan_jsonl<R: BufRead>(
+    reader: &mut R,
+    max_input_bytes: usize,
+    running: Option<&AtomicBool>,
+    mut handle_line: impl FnMut(&[u8]) -> LineOutcome,
+) -> Result<ScanReport, ScanStop> {
+    let mut report = ScanReport::default();
+    let mut line = Vec::with_capacity(max_input_bytes.min(256 * 1024));
+    let mut line_number = 0_usize;
+    loop {
+        if running.is_some_and(|flag| !flag.load(Ordering::Relaxed)) {
+            return Err(ScanStop::Interrupted);
+        }
+        let within_limit = match read_bounded_line(reader, &mut line, max_input_bytes) {
+            Ok(Some(value)) => value,
+            Ok(None) => return Ok(report),
+            Err(error) => return Err(ScanStop::Read(error)),
+        };
+        line_number += 1;
+        if !within_limit {
+            report.oversized += 1;
+            report.record_error(format!(
+                "Document JSON #{} superieur a max_doc_input_bytes ({})",
+                line_number, max_input_bytes,
+            ));
+            continue;
+        }
+        if line.iter().all(|byte| byte.is_ascii_whitespace()) {
+            continue;
+        }
+        sanitize_json_bytes(&mut line);
+        match handle_line(&line) {
+            LineOutcome::Valid => report.valid_lines += 1,
+            LineOutcome::Invalid(error) => {
+                report.invalid_json += 1;
+                report.record_error(format!("Erreur JSON #{}: {}", line_number, error));
+            }
+            LineOutcome::Stop => return Err(ScanStop::Consumer),
+        }
+    }
 }
 
 fn log_file_error(context: &ProcessContext<'_>, path_str: &str, error: String) {
@@ -1289,11 +1359,135 @@ fn prepare_document(
     })
 }
 
-fn process_file_transactional(
-    file_path: &Path,
+fn build_document(
+    prepared: &PreparedDocument,
     path_str: &str,
     context: &ProcessContext<'_>,
-) -> bool {
+) -> tantivy::TantivyDocument {
+    let mut doc = tantivy::TantivyDocument::default();
+    doc.add_text(context.fields.source, path_str);
+    doc.add_text(
+        context.fields.filename,
+        sanitize_content(
+            &prepared.filename,
+            context.sanitize_set,
+            context.config.max_word_length,
+        ),
+    );
+    doc.add_text(context.fields.doc_type, &prepared.doc_type);
+    doc.add_text(
+        context.fields.content,
+        sanitize_content(
+            &prepared.content,
+            context.sanitize_set,
+            context.config.max_word_length,
+        ),
+    );
+    if let Some(raw_field) = context.fields.content_raw {
+        let raw = if prepared.raw.is_empty() {
+            &prepared.content
+        } else {
+            &prepared.raw
+        };
+        doc.add_text(raw_field, raw);
+    }
+    doc
+}
+
+/// Verifie qu'un fichier se lit jusqu'au bout, sans construire de document.
+fn validate_lines<R: BufRead>(
+    reader: &mut R,
+    context: &ProcessContext<'_>,
+) -> Result<ScanReport, ScanStop> {
+    scan_jsonl(
+        reader,
+        context.config.max_doc_input_bytes,
+        Some(context.running),
+        |line| match serde_json::from_slice::<serde::de::IgnoredAny>(line) {
+            Ok(_) => LineOutcome::Valid,
+            Err(error) => LineOutcome::Invalid(error.to_string()),
+        },
+    )
+}
+
+/// Envoie au writer un document par ligne JSON valide.
+fn send_documents<R: BufRead>(
+    reader: &mut R,
+    path_str: &str,
+    default_filename: &str,
+    context: &ProcessContext<'_>,
+    running: Option<&AtomicBool>,
+) -> Result<ScanReport, ScanStop> {
+    let mut content = String::new();
+    scan_jsonl(
+        reader,
+        context.config.max_doc_input_bytes,
+        running,
+        |line| {
+            let json_value: Value = match serde_json::from_slice(line) {
+                Ok(value) => value,
+                Err(error) => return LineOutcome::Invalid(error.to_string()),
+            };
+            if let Some(prepared) =
+                prepare_document(&json_value, default_filename, context.config, &mut content)
+            {
+                let doc = build_document(&prepared, path_str, context);
+                if context.tx.send(PipelineEvent::Document(doc)).is_err() {
+                    return LineOutcome::Stop;
+                }
+                context.doc_count.fetch_add(1, Ordering::Relaxed);
+            }
+            LineOutcome::Valid
+        },
+    )
+}
+
+fn log_scan_stop(context: &ProcessContext<'_>, path_str: &str, stop: ScanStop) {
+    // Ctrl+C ou writer arrete: rien a signaler pour ce fichier.
+    if let ScanStop::Read(error) = stop {
+        log_file_error(context, path_str, format!("Erreur de lecture: {}", error));
+    }
+}
+
+/// Journalise les lignes ignorees d'un fichier: le detail des premieres, puis
+/// toujours un bilan, pour qu'aucun fichier incomplet ne passe inapercu.
+fn log_skipped_lines(context: &ProcessContext<'_>, path_str: &str, report: &ScanReport) {
+    let skipped = report.skipped_lines();
+    if skipped == 0 {
+        return;
+    }
+    context.skipped_lines.fetch_add(skipped, Ordering::Relaxed);
+    for error in &report.first_errors {
+        if context.logged_errors.fetch_add(1, Ordering::Relaxed) < MAX_ERROR_LOGS {
+            let _ = context.tx.send(PipelineEvent::ErrorLog {
+                file: path_str.to_string(),
+                error: error.clone(),
+            });
+        }
+    }
+    let _ = context.tx.send(PipelineEvent::ErrorLog {
+        file: path_str.to_string(),
+        error: format!(
+            "{} ligne(s) ignoree(s) ({} JSON invalide(s), {} trop longue(s)), \
+             {} ligne(s) valide(s) indexee(s)",
+            skipped, report.invalid_json, report.oversized, report.valid_lines,
+        ),
+    });
+}
+
+/// Indexe les lignes valides d'un fichier JSONL.
+///
+/// Retourne `true` quand le fichier a ete lu jusqu'au bout: son empreinte est
+/// alors memorisee, meme si des lignes invalides ont ete ignorees (elles sont
+/// comptees dans le journal). Un fichier sans aucune ligne valide n'est pas
+/// memorise et ne remplace jamais les documents deja indexes.
+///
+/// Rien n'est copie sur disque. Pour un remplacement, une premiere passe lit
+/// tout le fichier avant d'envoyer la suppression des anciens documents: une
+/// erreur de lecture laisse alors l'index intact. La seconde passe n'est pas
+/// interrompue par Ctrl+C, pour que le remplacement se termine et que le
+/// commit final reste possible.
+fn process_file(file_path: &Path, path_str: &str, context: &ProcessContext<'_>) -> bool {
     let file = match File::open(file_path) {
         Ok(file) => file,
         Err(error) => {
@@ -1301,208 +1495,71 @@ fn process_file_transactional(
             return false;
         }
     };
-    let (staging_path, mut staging_writer) = match create_staging_file() {
-        Ok(value) => value,
-        Err(error) => {
-            log_file_error(context, path_str, format!("Staging impossible: {}", error));
-            return false;
-        }
-    };
-
     let default_filename = file_path
         .file_name()
         .map(|value| value.to_string_lossy().to_string())
         .unwrap_or_else(|| "unknown.jsonl".to_string());
     let mut reader = BufReader::with_capacity(256 * 1024, file);
-    let mut line = Vec::with_capacity(context.config.max_doc_input_bytes.min(256 * 1024));
-    let mut content = String::new();
-    let mut line_number = 0_usize;
-    let mut file_has_errors = false;
+    let is_replacement = !context.replace_sources.is_empty();
 
-    loop {
-        if !context.running.load(Ordering::Relaxed) {
-            drop(staging_writer);
-            let _ = fs::remove_file(&staging_path);
-            return false;
-        }
-        let within_limit =
-            match read_bounded_line(&mut reader, &mut line, context.config.max_doc_input_bytes) {
-                Ok(Some(value)) => value,
-                Ok(None) => break,
-                Err(error) => {
-                    log_file_error(context, path_str, format!("Erreur de lecture: {}", error));
-                    drop(staging_writer);
-                    let _ = fs::remove_file(&staging_path);
-                    return false;
-                }
-            };
-        line_number += 1;
-        if !within_limit {
-            file_has_errors = true;
-            log_file_error(
-                context,
-                path_str,
-                format!(
-                    "Document JSON #{} superieur a max_doc_input_bytes ({})",
-                    line_number, context.config.max_doc_input_bytes,
-                ),
-            );
-            continue;
-        }
-        if line.iter().all(|byte| byte.is_ascii_whitespace()) {
-            continue;
-        }
-        sanitize_json_bytes(&mut line);
-        let json_value: Value = match serde_json::from_slice(&line) {
-            Ok(value) => value,
-            Err(error) => {
-                file_has_errors = true;
-                log_file_error(
-                    context,
-                    path_str,
-                    format!("Erreur JSON #{}: {}", line_number, error),
-                );
-                continue;
+    if is_replacement {
+        let validation = match validate_lines(&mut reader, context) {
+            Ok(report) => report,
+            Err(stop) => {
+                log_scan_stop(context, path_str, stop);
+                return false;
             }
         };
-
-        let Some(prepared) =
-            prepare_document(&json_value, &default_filename, context.config, &mut content)
-        else {
-            continue;
-        };
-        if let Err(error) = serde_json::to_writer(&mut staging_writer, &prepared) {
+        if validation.valid_lines == 0 && validation.skipped_lines() > 0 {
+            log_skipped_lines(context, path_str, &validation);
             log_file_error(
                 context,
                 path_str,
-                format!("Ecriture staging impossible: {}", error),
+                "Aucune ligne JSON valide: anciens documents conserves".to_string(),
             );
-            drop(staging_writer);
-            let _ = fs::remove_file(&staging_path);
             return false;
         }
-        if let Err(error) = writeln!(staging_writer) {
-            log_file_error(
-                context,
-                path_str,
-                format!("Ecriture staging impossible: {}", error),
-            );
-            drop(staging_writer);
-            let _ = fs::remove_file(&staging_path);
+        if let Err(error) = reader.seek(SeekFrom::Start(0)) {
+            log_file_error(context, path_str, format!("Erreur de lecture: {}", error));
             return false;
         }
-    }
-
-    if let Err(error) = staging_writer.flush() {
-        log_file_error(
-            context,
-            path_str,
-            format!("Flush staging impossible: {}", error),
-        );
-        drop(staging_writer);
-        let _ = fs::remove_file(&staging_path);
-        return false;
-    }
-    drop(staging_writer);
-    if file_has_errors {
-        let _ = fs::remove_file(&staging_path);
-        return false;
-    }
-
-    let validation_file = match File::open(&staging_path) {
-        Ok(file) => file,
-        Err(error) => {
-            log_file_error(context, path_str, format!("Staging illisible: {}", error));
-            let _ = fs::remove_file(&staging_path);
-            return false;
-        }
-    };
-    if serde_json::Deserializer::from_reader(BufReader::new(validation_file))
-        .into_iter::<PreparedDocument>()
-        .any(|value| value.is_err())
-    {
-        log_file_error(
-            context,
-            path_str,
-            "Staging invalide apres ecriture".to_string(),
-        );
-        let _ = fs::remove_file(&staging_path);
-        return false;
-    }
-
-    let is_replacement = !context.replace_sources.is_empty();
-    if is_replacement
-        && context
+        if context
             .tx
             .send(PipelineEvent::BeginReplace(
                 context.replace_sources.to_vec(),
             ))
             .is_err()
-    {
-        let _ = fs::remove_file(&staging_path);
-        return false;
+        {
+            return false;
+        }
     }
-    let staged_file = match File::open(&staging_path) {
-        Ok(file) => file,
-        Err(error) => {
-            log_file_error(context, path_str, format!("Staging illisible: {}", error));
-            let _ = fs::remove_file(&staging_path);
+
+    let running = if is_replacement {
+        None
+    } else {
+        Some(context.running)
+    };
+    let report = match send_documents(&mut reader, path_str, &default_filename, context, running) {
+        Ok(report) => report,
+        Err(stop) => {
+            // Remplacement entame sans EndReplace: le run refuse alors le
+            // commit final, aucune suppression partielle n'est validee.
+            log_scan_stop(context, path_str, stop);
             return false;
         }
     };
-    for prepared in serde_json::Deserializer::from_reader(BufReader::new(staged_file))
-        .into_iter::<PreparedDocument>()
-    {
-        let prepared = match prepared {
-            Ok(value) => value,
-            Err(error) => {
-                log_file_error(
-                    context,
-                    path_str,
-                    format!("Relecture staging impossible: {}", error),
-                );
-                let _ = fs::remove_file(&staging_path);
-                return false;
-            }
-        };
-        let mut doc = tantivy::TantivyDocument::default();
-        doc.add_text(context.fields.source, path_str);
-        doc.add_text(
-            context.fields.filename,
-            sanitize_content(
-                &prepared.filename,
-                context.sanitize_set,
-                context.config.max_word_length,
-            ),
-        );
-        doc.add_text(context.fields.doc_type, &prepared.doc_type);
-        doc.add_text(
-            context.fields.content,
-            sanitize_content(
-                &prepared.content,
-                context.sanitize_set,
-                context.config.max_word_length,
-            ),
-        );
-        if let Some(raw_field) = context.fields.content_raw {
-            let raw = if prepared.raw.is_empty() {
-                &prepared.content
-            } else {
-                &prepared.raw
-            };
-            doc.add_text(raw_field, raw);
-        }
-        if context.tx.send(PipelineEvent::Document(doc)).is_err() {
-            let _ = fs::remove_file(&staging_path);
-            return false;
-        }
-        context.doc_count.fetch_add(1, Ordering::Relaxed);
-    }
     if is_replacement && context.tx.send(PipelineEvent::EndReplace).is_err() {
-        let _ = fs::remove_file(&staging_path);
         return false;
     }
-    let _ = fs::remove_file(&staging_path);
+    log_skipped_lines(context, path_str, &report);
+    if report.valid_lines == 0 && report.skipped_lines() > 0 {
+        log_file_error(
+            context,
+            path_str,
+            "Aucune ligne JSON valide: fichier ignore".to_string(),
+        );
+        return false;
+    }
     true
 }
 
@@ -1542,6 +1599,7 @@ fn print_summary(
     elapsed: std::time::Duration,
     docs: usize,
     skipped: usize,
+    skipped_lines: usize,
     errors: usize,
     log_path: &Path,
 ) {
@@ -1549,6 +1607,13 @@ fn print_summary(
     println!("Temps total       : {:?}", elapsed);
     println!("Documents ajoutes : {}", docs);
     println!("Fichiers ignores  : {}", skipped);
+    if skipped_lines > 0 {
+        println!(
+            "Lignes ignorees   : {} (JSON invalide ou trop long, voir {})",
+            skipped_lines,
+            log_path.display()
+        );
+    }
     if errors > 0 {
         println!(
             "Erreurs           : {} (Voir {})",
@@ -1809,6 +1874,194 @@ mod tests {
             Some(true)
         );
         assert_eq!(output, b"{}\n");
+    }
+
+    #[test]
+    fn scan_counts_invalid_and_oversized_lines_and_keeps_reading() {
+        let input = b"{\"a\":1}
+not json
+
+0123456789012345678901234567890
+{\"b\":2}";
+        let mut reader = BufReader::new(&input[..]);
+        let mut seen = Vec::new();
+
+        let report = scan_jsonl(&mut reader, 20, None, |line| {
+            seen.push(String::from_utf8_lossy(line).trim().to_string());
+            match serde_json::from_slice::<Value>(line) {
+                Ok(_) => LineOutcome::Valid,
+                Err(error) => LineOutcome::Invalid(error.to_string()),
+            }
+        })
+        .ok()
+        .unwrap();
+
+        assert_eq!(seen, ["{\"a\":1}", "not json", "{\"b\":2}"]);
+        assert_eq!(report.valid_lines, 2);
+        assert_eq!(report.invalid_json, 1);
+        assert_eq!(report.oversized, 1);
+        assert!(report.first_errors[0].starts_with("Erreur JSON #2"));
+        assert!(report.first_errors[1].starts_with("Document JSON #4"));
+    }
+
+    #[test]
+    fn scan_stops_when_interrupted() {
+        let mut reader = BufReader::new(
+            &b"{}
+{}
+"[..],
+        );
+        let running = AtomicBool::new(false);
+
+        let result = scan_jsonl(&mut reader, 100, Some(&running), |_| LineOutcome::Valid);
+
+        assert!(matches!(result, Err(ScanStop::Interrupted)));
+    }
+
+    #[test]
+    fn scan_keeps_only_the_first_line_errors() {
+        let input = "x
+"
+        .repeat(MAX_LINE_ERRORS_PER_FILE + 4);
+        let mut reader = BufReader::new(input.as_bytes());
+
+        let report = scan_jsonl(&mut reader, 100, None, |_| {
+            LineOutcome::Invalid("bad".to_string())
+        })
+        .ok()
+        .unwrap();
+
+        assert_eq!(report.invalid_json, MAX_LINE_ERRORS_PER_FILE + 4);
+        assert_eq!(report.first_errors.len(), MAX_LINE_ERRORS_PER_FILE);
+    }
+
+    #[derive(Debug, PartialEq)]
+    enum Seen {
+        Doc,
+        Begin,
+        End,
+        Log(String),
+    }
+
+    /// Passe un fichier fictif dans `process_file` et note ce qui part au writer.
+    fn run_process_file(name: &str, content: &str, replace: &[String]) -> (bool, Vec<Seen>, usize) {
+        let dir = temp_dir(name);
+        let file = dir.join("source.jsonl");
+        fs::write(&file, content).unwrap();
+        let config = Config::default();
+        let (_schema, fields) = crate::schema::build_schema(&config);
+        let sanitize_set = config.sanitize_set();
+        let (tx, rx) = mpsc::sync_channel(1000);
+        let running = AtomicBool::new(true);
+        let doc_count = AtomicUsize::new(0);
+        let error_count = AtomicUsize::new(0);
+        let logged_errors = AtomicUsize::new(0);
+        let skipped_lines = AtomicUsize::new(0);
+        let path_str = file.to_string_lossy().to_string();
+        let ok = {
+            let context = ProcessContext {
+                fields: &fields,
+                config: &config,
+                sanitize_set: &sanitize_set,
+                tx: &tx,
+                running: &running,
+                doc_count: &doc_count,
+                error_count: &error_count,
+                logged_errors: &logged_errors,
+                skipped_lines: &skipped_lines,
+                replace_sources: replace,
+            };
+            process_file(&file, &path_str, &context)
+        };
+        drop(tx);
+        let seen: Vec<Seen> = rx
+            .into_iter()
+            .map(|event| match event {
+                PipelineEvent::Document(_) => Seen::Doc,
+                PipelineEvent::BeginReplace(_) => Seen::Begin,
+                PipelineEvent::EndReplace => Seen::End,
+                PipelineEvent::ErrorLog { error, .. } => Seen::Log(error),
+            })
+            .collect();
+        fs::remove_dir_all(dir).unwrap();
+        let docs = seen.iter().filter(|event| **event == Seen::Doc).count();
+        assert_eq!(doc_count.load(Ordering::Relaxed), docs);
+        (ok, seen, skipped_lines.load(Ordering::Relaxed))
+    }
+
+    #[test]
+    fn invalid_line_no_longer_discards_the_whole_file() {
+        let (ok, seen, skipped) = run_process_file(
+            "oeil_partial_file",
+            "{\"name\":\"Alice Martin\"}
+{broken
+{\"name\":\"Bob Durand\"}
+",
+            &[],
+        );
+
+        assert!(ok, "le fichier lu jusqu'au bout doit etre memorise");
+        assert_eq!(skipped, 1);
+        assert_eq!(seen.iter().filter(|event| **event == Seen::Doc).count(), 2);
+        let logs: Vec<&String> = seen
+            .iter()
+            .filter_map(|event| match event {
+                Seen::Log(text) => Some(text),
+                _ => None,
+            })
+            .collect();
+        assert!(logs[0].starts_with("Erreur JSON #2"));
+        assert!(logs[1].starts_with("1 ligne(s) ignoree(s)"));
+        assert!(logs[1].contains("2 ligne(s) valide(s)"));
+    }
+
+    #[test]
+    fn replacement_without_any_valid_line_keeps_old_documents() {
+        let (ok, seen, _) = run_process_file(
+            "oeil_replace_invalid",
+            "{broken
+not json
+",
+            &["old".to_string()],
+        );
+
+        assert!(!ok);
+        assert!(
+            !seen.contains(&Seen::Begin),
+            "aucune suppression ne doit partir"
+        );
+        assert!(!seen.contains(&Seen::Doc));
+    }
+
+    #[test]
+    fn replacement_wraps_valid_documents_in_begin_and_end() {
+        let (ok, seen, skipped) = run_process_file(
+            "oeil_replace_valid",
+            "{\"a\":\"un\"}
+{broken
+{\"a\":\"deux\"}
+",
+            &["old".to_string()],
+        );
+
+        assert!(ok);
+        assert_eq!(skipped, 1);
+        assert_eq!(&seen[..4], [Seen::Begin, Seen::Doc, Seen::Doc, Seen::End]);
+    }
+
+    #[test]
+    fn empty_lines_only_file_is_accepted_without_documents() {
+        let (ok, seen, skipped) = run_process_file(
+            "oeil_empty_lines",
+            "
+  
+",
+            &[],
+        );
+
+        assert!(ok);
+        assert_eq!(skipped, 0);
+        assert!(seen.is_empty());
     }
 
     #[test]

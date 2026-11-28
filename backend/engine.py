@@ -9,6 +9,7 @@ from pathlib import Path
 import tantivy
 from tantivy import Filter, TextAnalyzerBuilder, Tokenizer
 
+from query_terms import quote_query_terms
 from settings import INDEX_PATH_CHECK_ATTEMPTS, INDEX_PATH_CHECK_DELAY_MS
 
 logger = logging.getLogger("oeil-engine")
@@ -16,6 +17,7 @@ _STATS_TTL_SECONDS = 300       # cache stats legeres (num_docs, segments) : 5 mi
 _INDEX_SIZE_TTL_SECONDS = 3600  # cache taille index (os.walk) : 1 h
 _RELOAD_INTERVAL_SECONDS = 30.0  # throttle reload() : au plus 1 fois toutes les 30 s
 _LOCK_FILENAMES = (".tantivy-meta.lock", ".tantivy-writer.lock")
+_DEFAULT_SEARCH_FIELDS = ["content", "filename"]
 # Codes acceptes par l'indexeur Rust -> noms attendus par tantivy-py.
 _TANTIVY_PY_LANGUAGES = {
     "fr": "french",
@@ -283,6 +285,30 @@ class SearchEngine:
             with self._reload_lock:
                 self._reload_in_progress = False
 
+    def _parse_query(self, query: str):
+        """Analyse la requete, avec repli sur des phrases si la syntaxe est refusee.
+
+        Le parseur Tantivy rejette O'Brien, une URL (`http:` lu comme un champ),
+        une adresse IPv6 ou une parenthese seule. Chaque mot est alors cherche
+        comme la phrase de ses tokens, ce que l'index aurait de toute facon
+        compare : la recherche aboutit au lieu de renvoyer une erreur 400.
+        """
+        try:
+            return self.index.parse_query(query, _DEFAULT_SEARCH_FIELDS)
+        except Exception as exc:
+            first_error = exc
+        tried = {query}
+        for keep_operators in (True, False):
+            fallback = quote_query_terms(query, keep_operators=keep_operators)
+            if not fallback or fallback in tried:
+                continue
+            tried.add(fallback)
+            try:
+                return self.index.parse_query(fallback, _DEFAULT_SEARCH_FIELDS)
+            except Exception:
+                continue
+        raise SearchQueryError(str(first_error)) from first_error
+
     def search(self, query: str, limit: int = 20, offset: int = 0) -> dict:
         self._maybe_reload()
         try:
@@ -290,10 +316,7 @@ class SearchEngine:
         except Exception as exc:
             raise IndexAccessError(f"Index indisponible '{self.index_path}': {exc}") from exc
 
-        try:
-            parsed = self.index.parse_query(query, ["content", "filename"])
-        except Exception as exc:
-            raise SearchQueryError(str(exc)) from exc
+        parsed = self._parse_query(query)
 
         try:
             results = searcher.search(parsed, limit + offset)
@@ -302,13 +325,16 @@ class SearchEngine:
         raw_hits = results.hits if hasattr(results, "hits") else results
 
         hits = []
-        for score, doc_address in raw_hits[offset:]:
+        page = raw_hits[offset:]
+        read_errors: list[Exception] = []
+        for score, doc_address in page:
             try:
                 doc = searcher.doc(doc_address)
             except Exception as exc:
-                raise IndexAccessError(
-                    f"Lecture resultat impossible sur '{self.index_path}': {exc}"
-                ) from exc
+                # Un document illisible ne condamne pas l'index entier : il est
+                # saute. Si aucun ne se lit, l'index est vraiment inaccessible.
+                read_errors.append(exc)
+                continue
             # Fallback: si content_raw est absent (ancien index sans index_raw_content=true),
             # on utilise content (version sanitisee). Les snippets seront moins fideles
             # au contenu original mais restent exploitables.
@@ -321,6 +347,16 @@ class SearchEngine:
                 "content_raw": raw,
             }
             hits.append(hit)
+
+        if read_errors:
+            if not hits:
+                raise IndexAccessError(
+                    f"Lecture resultats impossible sur '{self.index_path}': {read_errors[0]}"
+                ) from read_errors[0]
+            logger.warning(
+                "%s resultat(s) illisible(s) ignore(s) sur '%s' (%s/%s lus): %s",
+                len(read_errors), self.index_path, len(hits), len(page), read_errors[0],
+            )
 
         return {
             "query": query,

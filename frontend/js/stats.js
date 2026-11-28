@@ -431,11 +431,18 @@
         }, 2000);
     }
 
+    // Chaque chargement recoit un numero : une reponse arrivee apres un
+    // changement d'index est ignoree, au lieu d'ecraser l'affichage du nouvel
+    // index ou de recreer des graphiques sur un canvas deja utilise.
+    var _statsLoadGeneration = 0;
+
     function loadStats(indexId) {
         var url = API_BASE + '/api/stats';
         if (indexId) {
             url += '?index=' + encodeURIComponent(indexId);
         }
+        var generation = ++_statsLoadGeneration;
+        var isCurrent = function () { return generation === _statsLoadGeneration; };
         clearIndexSizeRefresh();
         destroyCharts();
 
@@ -448,9 +455,11 @@
 
         apiFetch(url)
             .then(function (res) {
+                if (!isCurrent()) return null;
                 clearStatsBackendRetry();
                 if (res.status === 409) {
                     return res.json().then(function (err) {
+                        if (!isCurrent()) return null;
                         var detail = err.detail || 'Index indisponible';
                         setEmptyAnalysisState(detail);
                         setStatsAvailabilityState('index_unavailable', detail);
@@ -464,7 +473,7 @@
                 return res.json();
             })
             .then(function (data) {
-                if (!data) return;
+                if (!data || !isCurrent()) return;
                 statsState.backendDegraded = false;
                 updateReadyAvailability();
                 var analysis = data.analysis || null;
@@ -526,6 +535,7 @@
                 }
             })
             .catch(function (err) {
+                if (!isCurrent()) return;
                 console.error('Erreur chargement stats:', err);
                 setEmptyAnalysisState('Backend ou index temporairement indisponible');
                 setStatsAvailabilityState(

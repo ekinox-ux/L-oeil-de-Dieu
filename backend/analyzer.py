@@ -109,8 +109,8 @@ def _get_lock_path(source_dir: str) -> Path:
 
 def _acquire_lock(source_dir: str) -> bool:
     """Cree le lockfile contenant le source_dir. Retourne False si deja present.
-    Le champ pid n'est pas utilise pour la supervision — il sert uniquement
-    au diagnostic manuel (quel process a cree le lock)."""
+    owner_pid (le backend) puis worker_pid (le worker, renseigne a son
+    demarrage) permettent de reconnaitre un lock dont le processus est mort."""
     lock_path = _get_lock_path(source_dir)
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     try:
@@ -158,6 +158,71 @@ def _touch_lock(source_dir: str) -> None:
 
 
 _LOCK_MAX_AGE_SECONDS = 86400  # 24h — au-dela, un lock est considere potentiellement orphelin
+# Delai laisse au worker pour inscrire son PID apres le lancement.
+_LOCK_STARTUP_GRACE_SECONDS = 120
+
+
+def _pid_is_running(pid) -> bool | None:
+    """True si le processus existe, False s'il est termine, None si inconnu.
+
+    Un PID recycle par un autre processus passe pour vivant : le lock est
+    alors garde et seule la regle des 24 h s'applique, jamais l'inverse.
+    """
+    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+        return None
+    if os.name == "nt":
+        import ctypes
+
+        process_query_limited_information = 0x1000
+        still_active = 259
+        error_access_denied = 5
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.OpenProcess.restype = ctypes.c_void_p
+        kernel32.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
+        kernel32.GetExitCodeProcess.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint32)]
+        kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+        handle = kernel32.OpenProcess(process_query_limited_information, 0, pid)
+        if not handle:
+            return True if ctypes.get_last_error() == error_access_denied else False
+        try:
+            exit_code = ctypes.c_uint32()
+            if not kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+                return None
+            return exit_code.value == still_active
+        finally:
+            kernel32.CloseHandle(handle)
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return None
+    return True
+
+
+def _lock_process_is_dead(data: dict, lock_age: float) -> bool:
+    """Le processus qui tient le lock est-il certainement termine ?
+
+    Le worker inscrit son PID des son demarrage. Tant qu'il ne l'a pas fait,
+    le lock appartient au backend qui l'a lance ; on lui laisse un court delai
+    avant de conclure que le worker n'a jamais demarre.
+    """
+    worker_pid = data.get("worker_pid")
+    if worker_pid is not None:
+        return _pid_is_running(worker_pid) is False
+    if lock_age < _LOCK_STARTUP_GRACE_SECONDS:
+        return False
+    return _pid_is_running(data.get("owner_pid")) is False
+
+
+def _lock_age(entry: Path, now: float) -> float | None:
+    """Age du lock, ou None s'il vient d'etre supprime (fin du worker)."""
+    try:
+        return now - entry.stat().st_mtime
+    except OSError:
+        return None
 
 
 def _lock_has_recent_progress(source_dir: str, now: float) -> bool:
@@ -180,9 +245,10 @@ def _find_active_lock() -> str | None:
     """Scanne CACHE_DIR pour trouver un lockfile actif.
     Retourne le source_dir contenu dans le lock, ou None.
 
-    Un lockfile trop ancien (> 24h) est supprime automatiquement, sauf si
-    un fichier progress associe a ete modifie recemment (signe d'activite).
-    Un lockfile illisible ou corrompu est ignore (pas de faux positif)."""
+    Un lockfile dont le worker est mort est supprime aussitot. Un lockfile
+    trop ancien (> 24h) l'est aussi, sauf si un fichier progress associe a ete
+    modifie recemment (signe d'activite). Un lockfile illisible, corrompu ou
+    supprime pendant la lecture est ignore (pas de faux positif)."""
     now = time.time()
     for entry in _iter_analyzer_locks():
         try:
@@ -193,7 +259,18 @@ def _find_active_lock() -> str | None:
         except (json.JSONDecodeError, OSError):
             continue
 
-        lock_age = now - entry.stat().st_mtime
+        lock_age = _lock_age(entry, now)
+        if lock_age is None:
+            continue
+
+        if _lock_process_is_dead(data, lock_age):
+            _logger.warning("Lock orphelin supprime (processus termine) pour %s", source)
+            try:
+                entry.unlink()
+            except OSError:
+                pass
+            continue
+
         if lock_age <= _LOCK_MAX_AGE_SECONDS:
             return source
 
@@ -234,12 +311,14 @@ def cleanup_stale_analyzer_locks(source_dir: str | None = None) -> dict:
         if source_dir and source != source_dir:
             continue
 
-        try:
-            lock_age = now - entry.stat().st_mtime
-        except OSError:
-            lock_age = 0
+        lock_age = _lock_age(entry, now)
+        if lock_age is None:
+            continue  # deja supprime par le worker
 
-        if lock_age <= _LOCK_MAX_AGE_SECONDS or _lock_has_recent_progress(source, now):
+        process_dead = _lock_process_is_dead(data, lock_age)
+        if not process_dead and (
+            lock_age <= _LOCK_MAX_AGE_SECONDS or _lock_has_recent_progress(source, now)
+        ):
             kept.append(source)
             continue
 

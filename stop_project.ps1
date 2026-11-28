@@ -62,10 +62,47 @@ foreach ($name in @("backend.pid", "frontend.pid", "bot.pid")) {
 # qu'il s'agit bien de l'analyseur de ce projet. Si CIM est interdit, le verrou reste
 # en place plutot que de risquer d'arreter un autre processus Python.
 $rootPattern = [regex]::Escape($projectRoot)
-Get-ChildItem -LiteralPath (Join-Path $projectRoot "backend") -Filter "analyzer_*.lock" -File -ErrorAction SilentlyContinue |
+
+# Les verrous vivent dans CACHE_DIR, que OEIL_CACHE_DIR (backend\.env compris)
+# peut deplacer hors de backend\ : on le demande a settings.py, comme le backend.
+$backendDir = Join-Path $projectRoot "backend"
+$lockDirs = @($backendDir)
+$previousPreference = $ErrorActionPreference
+$ErrorActionPreference = "Continue"
+try {
+    # Pas de Select-Object -First ici : il couperait le pipeline et
+    # $LASTEXITCODE vaudrait -1 meme quand Python reussit.
+    $output = & $expectedPython -I -c "import sys; sys.path.insert(0, sys.argv[1]); import settings; print(settings.CACHE_DIR)" $backendDir 2>$null
+    $cacheDir = @($output)[0]
+    if ($LASTEXITCODE -eq 0 -and $cacheDir -and (Test-Path -LiteralPath $cacheDir -PathType Container)) {
+        $lockDirs += [string]$cacheDir
+    }
+}
+catch {
+    # settings.py illisible : on garde au moins backend\.
+}
+finally {
+    $ErrorActionPreference = $previousPreference
+}
+
+$seenDirs = @{}
+$lockFiles = foreach ($dir in $lockDirs) {
+    $key = [System.IO.Path]::GetFullPath($dir).TrimEnd('\').ToLowerInvariant()
+    if ($seenDirs.ContainsKey($key)) {
+        continue
+    }
+    $seenDirs[$key] = $true
+    Get-ChildItem -LiteralPath $dir -Filter "analyzer_*.lock" -File -ErrorAction SilentlyContinue
+}
+
+$lockFiles |
     ForEach-Object {
         try {
             $data = Get-Content -Raw -LiteralPath $_.FullName | ConvertFrom-Json
+            if (-not $data.worker_pid) {
+                # Worker pas encore inscrit : le backend gere ce cas lui-meme.
+                return
+            }
             $workerPid = [int]$data.worker_pid
             $worker = Get-Process -Id $workerPid -ErrorAction SilentlyContinue
             if ($null -eq $worker) {

@@ -27,7 +27,12 @@
  *     (regex EMAIL_RE). L'appel API est delegue a SearchApi.fetchBreaches()
  *     qui interroge /api/breaches (multi-provider: HIBP, BreachDirectory).
  *
- * Exporte: window.SearchComponents = { renderCard }
+ * - Positions des highlights:
+ *     Le backend compte en caracteres Unicode (points de code), JavaScript en
+ *     unites UTF-16 : renderSnippet() decoupe donc le texte par point de code,
+ *     sinon le surlignage se decale apres un emoji ou un caractere rare.
+ *
+ * Exporte: window.SearchComponents = { renderCard, renderSnippet, safeHttpUrl }
  */
 (function () {
     'use strict';
@@ -44,18 +49,33 @@
             return escapeHtml(text);
         }
 
+        // Array.from decoupe par point de code, comme les positions Python.
+        var chars = Array.from(text);
+        var slice = function (start, end) { return chars.slice(start, end).join(''); };
         highlights.sort(function (a, b) { return a[0] - b[0]; });
         var result = '';
         var lastEnd = 0;
         highlights.forEach(function (h) {
-            var start = h[0];
-            var end = h[1];
-            result += escapeHtml(text.substring(lastEnd, start));
-            result += '<mark>' + escapeHtml(text.substring(start, end)) + '</mark>';
+            var start = Math.max(Number(h[0]) || 0, lastEnd);
+            var end = Math.min(Number(h[1]) || 0, chars.length);
+            if (end <= start) return; // vide, hors texte ou chevauchant
+            result += escapeHtml(slice(lastEnd, start));
+            result += '<mark>' + escapeHtml(slice(start, end)) + '</mark>';
             lastEnd = end;
         });
-        result += escapeHtml(text.substring(lastEnd));
+        result += escapeHtml(slice(lastEnd, chars.length));
         return result;
+    }
+
+    /** Retourne l'URL si elle est en http(s), sinon null (javascript:, data:...). */
+    function safeHttpUrl(value) {
+        if (typeof value !== 'string' || !value) return null;
+        try {
+            var url = new URL(value);
+            return url.protocol === 'https:' || url.protocol === 'http:' ? url.href : null;
+        } catch (e) {
+            return null;
+        }
     }
 
     var EMAIL_RE = /[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}/;
@@ -102,10 +122,11 @@
                     var entry = document.createElement('div');
                     entry.className = 'hibp-breach';
 
-                    if (b.logo_url) {
+                    var logoUrl = safeHttpUrl(b.logo_url);
+                    if (logoUrl) {
                         var logo = document.createElement('img');
                         logo.className = 'hibp-breach-logo';
-                        logo.src = b.logo_url;
+                        logo.src = logoUrl;
                         logo.alt = b.name || '';
                         logo.width = 24;
                         logo.height = 24;
@@ -214,10 +235,11 @@
                         details.appendChild(attrSpan);
                     }
 
-                    if (hibp && hibp.disclosure_url) {
+                    var disclosureUrl = hibp ? safeHttpUrl(hibp.disclosure_url) : null;
+                    if (disclosureUrl) {
                         var discLink = document.createElement('a');
                         discLink.className = 'hibp-breach-disclosure';
-                        discLink.href = hibp.disclosure_url;
+                        discLink.href = disclosureUrl;
                         discLink.target = '_blank';
                         discLink.rel = 'noopener noreferrer';
                         discLink.textContent = 'Disclosure';
@@ -390,6 +412,8 @@
     }
 
     window.SearchComponents = {
-        renderCard: renderCard
+        renderCard: renderCard,
+        renderSnippet: renderSnippet,
+        safeHttpUrl: safeHttpUrl
     };
 })();

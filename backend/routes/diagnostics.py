@@ -5,7 +5,7 @@ from pathlib import Path
 from fastapi import APIRouter, Depends, Query, Request
 
 from analyzer import CACHE_DIR, _get_lock_path, cleanup_stale_analyzer_locks
-from deps import get_indexes_snapshot, verify_api_key, request_index_retry
+from deps import _is_dir_with_timeout, get_indexes_snapshot, request_index_retry, verify_api_key
 
 router = APIRouter(prefix="/api")
 
@@ -35,6 +35,9 @@ def _lockfile_snapshot(index_path: str) -> list[dict]:
 
 @router.get("/diagnostics")
 def diagnostics(request: Request, _=Depends(verify_api_key)):
+    # La page Maintenance interroge cette route toutes les 10 s : chaque acces
+    # disque passe par un controle borne dans le temps, pour qu'un volume qui
+    # ne repond plus (X: debranche, partage reseau) ne bloque pas les threads.
     payload = {
         "cache_dir": str(CACHE_DIR),
         "indexes": [],
@@ -43,7 +46,8 @@ def diagnostics(request: Request, _=Depends(verify_api_key)):
     for idx_id, cfg in get_indexes_snapshot().items():
         index_path = Path(cfg.get("path", ""))
         source_raw = cfg.get("source", "")
-        source_path = Path(source_raw) if source_raw else None
+        path_exists = _is_dir_with_timeout(str(index_path)) if cfg.get("path") else False
+        source_exists = _is_dir_with_timeout(source_raw) if source_raw else False
         payload["indexes"].append({
             "id": idx_id,
             "name": cfg.get("name", idx_id),
@@ -55,12 +59,13 @@ def diagnostics(request: Request, _=Depends(verify_api_key)):
             "last_error_at": float(cfg.get("last_error_at", 0.0) or 0.0),
             "last_ready_at": float(cfg.get("last_ready_at", 0.0) or 0.0),
             "path": str(index_path),
-            "path_exists": index_path.is_dir(),
+            "path_exists": path_exists,
             "source": source_raw,
-            "source_exists": source_path.is_dir() if source_path else False,
+            "source_exists": source_exists,
             "analyzer_lock": str(_get_lock_path(source_raw)) if source_raw else "",
             "analyzer_lock_exists": _get_lock_path(source_raw).exists() if source_raw else False,
-            "lockfiles": _lockfile_snapshot(str(index_path)),
+            # Lus seulement si le dossier vient de repondre.
+            "lockfiles": _lockfile_snapshot(str(index_path)) if path_exists else [],
         })
 
     return payload

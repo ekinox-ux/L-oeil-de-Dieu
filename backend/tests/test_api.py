@@ -215,6 +215,30 @@ def test_diagnostics_reports_index_paths_and_lockfiles(client, request):
     assert test_index["lockfiles"][0]["name"] == ".tantivy-meta.lock"
 
 
+def test_diagnostics_does_not_touch_unresponsive_volumes(client, monkeypatch):
+    """Un volume qui ne repond plus est signale absent sans bloquer la route."""
+    checked = []
+
+    def unresponsive(path):
+        checked.append(path)
+        return False  # ce que renvoie le controle borne apres son timeout
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("acces disque non borne")
+
+    monkeypatch.setattr(route_diagnostics, "_is_dir_with_timeout", unresponsive)
+    monkeypatch.setattr(route_diagnostics, "_lockfile_snapshot", forbidden)
+
+    res = client.get("/api/diagnostics", headers=_headers())
+
+    assert res.status_code == 200
+    test_index = next(item for item in res.json()["indexes"] if item["id"] == "test")
+    assert test_index["path_exists"] is False
+    assert test_index["source_exists"] is False
+    assert test_index["lockfiles"] == []
+    assert len(checked) == 2
+
+
 def test_cleanup_analyzer_locks_endpoint_returns_summary(client, monkeypatch):
     source = deps.indexes["test"]["source"]
     monkeypatch.setattr(
