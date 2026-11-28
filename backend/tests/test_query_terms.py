@@ -176,8 +176,8 @@ class _Doc:
 
 def _engine_with_docs(tmp_path, doc_impl):
     class Searcher:
-        def search(self, _parsed, _limit):
-            return type("R", (), {"hits": [(1.0, 0), (0.9, 1), (0.8, 2)], "count": 3})()
+        def search(self, _parsed, _limit, count=True):
+            return type("R", (), {"hits": [(1.0, 0), (0.9, 1), (0.8, 2)], "count": 3 if count else None})()
 
         def doc(self, address):
             return doc_impl(address)
@@ -186,7 +186,7 @@ def _engine_with_docs(tmp_path, doc_impl):
         def searcher(self):
             return Searcher()
 
-        def parse_query(self, query, _fields):
+        def parse_query(self, query, _fields, **_kwargs):
             return query
 
         def reload(self):
@@ -226,7 +226,7 @@ def test_unrecoverable_query_still_raises(tmp_path):
     eng = _engine_with_docs(tmp_path, _Doc)
     tried = []
 
-    def always_fails(query, _fields):
+    def always_fails(query, _fields, **_kwargs):
         tried.append(query)
         raise ValueError("syntaxe")
 

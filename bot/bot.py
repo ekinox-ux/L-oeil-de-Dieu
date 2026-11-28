@@ -193,6 +193,8 @@ SEARCH_CONTEXT_CHARS = 300
 # Extrait par resultat quand la page n'impose pas de budget plus petit.
 MAX_SNIPPET_CHARS = 1500
 _CODE_FENCE_OVERHEAD = len("\n```\n\n```")
+# Rien ne contenait tous les mots : l'API a elargi a "au moins un mot".
+RELAXED_NOTICE = "*Aucun resultat ne contient tous les mots : voici ceux qui en contiennent au moins un.*"
 
 
 def _excerpt(text: str, highlights: list | None, max_chars: int) -> str:
@@ -230,8 +232,10 @@ def format_hit(hit: dict, index: int, max_snippet_chars: int = MAX_SNIPPET_CHARS
 
     score = hit.get("score", 0)
     hit_type = hit.get("type", "?")
+    # Recherche sur tous les index : de quelle fuite vient le resultat.
+    origin = f" [{hit['index_name']}]" if hit.get("index_name") else ""
 
-    header = f"**{index}. {name}** ({hit_type}) — score: {score:.2f}"
+    header = f"**{index}. {name}**{origin} ({hit_type}) — score: {score:.2f}"
     snippets = hit.get("snippets", [])
     if not snippets:
         return header
@@ -585,6 +589,9 @@ class SearchPaginator(discord.ui.View):
         *,
         index: str | None = None,
         result_limit: int | None = None,
+        match_mode: str | None = None,
+        relaxed: bool = False,
+        skipped_indexes: list | None = None,
     ):
         super().__init__(timeout=600)
         self.message: discord.Message | None = None
@@ -594,6 +601,10 @@ class SearchPaginator(discord.ui.View):
         self.user_id = user_id
         self.index = index
         self.result_limit = result_limit
+        # Les pages suivantes reprennent le mode de la page 1 et son total.
+        self.match_mode = match_mode
+        self.relaxed = relaxed
+        self.skipped_indexes = skipped_indexes or []
         self.server_pagination = result_limit is not None
         self.display_total = min(total, result_limit) if result_limit is not None else len(hits)
         self.page = 0
@@ -617,9 +628,14 @@ class SearchPaginator(discord.ui.View):
             end = start + RESULTS_PER_PAGE
             page_hits = self.hits[start:end]
 
+        if self.relaxed:
+            budget = EMBED_DESCRIPTION_LIMIT - len(RELAXED_NOTICE) - 2
+            description = RELAXED_NOTICE + "\n\n" + format_hits_page(page_hits, start + 1, budget)
+        else:
+            description = format_hits_page(page_hits, start + 1)
         embed = discord.Embed(
             title=f"Recherche : {self.query}",
-            description=format_hits_page(page_hits, start + 1),
+            description=description,
             color=0x3b82f6,
         )
         loaded = len(self.hits)
@@ -634,6 +650,9 @@ class SearchPaginator(discord.ui.View):
             footer = f"{loaded} resultats affiches sur {self.total} — page {self.page + 1}/{self.max_page + 1}"
         else:
             footer = f"{self.total} resultats — page {self.page + 1}/{self.max_page + 1}"
+        if self.skipped_indexes:
+            names = ", ".join(item.get("name") or item.get("id", "?") for item in self.skipped_indexes)
+            footer += f" — index ignores : {names} (total minimum)"
         embed.set_footer(text=footer)
         return embed
 
@@ -648,13 +667,18 @@ class SearchPaginator(discord.ui.View):
         }
         if self.index:
             params["index"] = self.index
+        if self.match_mode in ("all", "any"):
+            # Total deja connu : l'API ne recompte pas, mode de la page 1 garde.
+            params["match"] = self.match_mode
+            params["count"] = "false"
 
         data = await api_get("/api/search", params, timeout=180.0, retry_on_timeout=False)
         if data is None or data.get("_error"):
             await interaction.followup.send(embed=_error_embed(data), ephemeral=True)
             return False
 
-        self.total = data.get("total", self.total)
+        if data.get("total") is not None:
+            self.total = data["total"]
         self.display_total = min(self.total, self.result_limit or self.total)
         self.max_page = max(0, (self.display_total - 1) // RESULTS_PER_PAGE)
         self.hits = data.get("hits", [])
@@ -766,7 +790,7 @@ def _error_embed(data: dict | None, fallback_desc: str = "Impossible de contacte
 @app_commands.describe(
     query="Terme de recherche (email, nom, telephone...)",
     limit="Nombre de resultats (max 50)",
-    index="Index a interroger (ex: france, index-foreign)",
+    index="Index a interroger (ex: france, index-foreign ; all = tous les index)",
 )
 @app_commands.checks.cooldown(5, 60.0)
 @has_required_role()
@@ -797,7 +821,7 @@ async def cmd_search(interaction: discord.Interaction, query: str, limit: int = 
         await interaction.followup.send(embed=_error_embed(data))
         return
 
-    total = data.get("total", 0)
+    total = data.get("total") or 0
     hits = data.get("hits", [])
 
     if total == 0:
@@ -816,6 +840,9 @@ async def cmd_search(interaction: discord.Interaction, query: str, limit: int = 
         interaction.user.id,
         index=index,
         result_limit=limit,
+        match_mode=data.get("match_mode"),
+        relaxed=bool(data.get("relaxed")),
+        skipped_indexes=data.get("skipped_indexes"),
     )
     msg = await interaction.followup.send(embed=view.build_embed(), view=view, wait=True)
     view.message = msg

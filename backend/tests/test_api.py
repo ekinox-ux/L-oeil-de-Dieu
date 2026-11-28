@@ -38,13 +38,19 @@ class DummyEngine:
             "index_size": "1 Ko",
             "segments": [],
         }
+        self.calls = []
 
-    def search(self, query: str, limit: int = 20, offset: int = 0) -> dict:
+    def search(self, query: str, limit: int = 20, offset: int = 0, *, match_all=True, count=True) -> dict:
+        self.calls.append({"query": query, "limit": limit, "offset": offset,
+                           "match_all": match_all, "count": count})
         payload = dict(self._search_payload)
         payload["query"] = query
         payload["limit"] = limit
         payload["offset"] = offset
         payload["hits"] = [dict(hit) for hit in self._search_payload["hits"]]
+        payload.setdefault("has_more", offset + limit < payload["total"])
+        if not count:
+            payload["total"] = None
         return payload
 
     def stats(self) -> dict:
@@ -1078,7 +1084,7 @@ def test_no_ready_index_returns_503(client):
 
 def test_search_query_error_does_not_mark_index_error(client):
     class QueryErrorEngine(DummyEngine):
-        def search(self, query: str, limit: int = 20, offset: int = 0) -> dict:
+        def search(self, query: str, limit: int = 20, offset: int = 0, **_kwargs) -> dict:
             raise SearchQueryError("bad syntax")
 
     deps.indexes["test"]["engine"] = QueryErrorEngine()
@@ -1091,7 +1097,7 @@ def test_search_query_error_does_not_mark_index_error(client):
 
 def test_search_index_access_error_marks_index_error(client):
     class BrokenIndexEngine(DummyEngine):
-        def search(self, query: str, limit: int = 20, offset: int = 0) -> dict:
+        def search(self, query: str, limit: int = 20, offset: int = 0, **_kwargs) -> dict:
             raise IndexAccessError("writer lock stuck")
 
     deps.indexes["test"]["engine"] = BrokenIndexEngine()
@@ -1226,3 +1232,234 @@ def test_analyze_uses_configured_source_as_cache_key(client, monkeypatch):
 
     assert res.status_code == 200
     assert captured["source"] == deps.indexes["test"]["source"]
+
+
+# ---- pertinence : ET par defaut, repli en OU, total, tous les index ----
+
+def _hit(source, content, score=1.0):
+    return {"score": score, "source": source, "filename": "f.jsonl", "type": "record", "content_raw": content}
+
+
+class RelaxingEngine(DummyEngine):
+    """Rien avec tous les mots, des resultats avec au moins un."""
+
+    def search(self, query, limit=20, offset=0, *, match_all=True, count=True):
+        self.calls.append({"match_all": match_all, "count": count, "offset": offset})
+        if match_all:
+            return {"query": query, "total": 0, "limit": limit, "offset": offset, "hits": [],
+                    "has_more": False, "relaxable": True}
+        return {"query": query, "total": 1, "limit": limit, "offset": offset, "has_more": False,
+                "hits": [_hit("C:/data/co/f.jsonl", "jean dupont")]}
+
+
+def test_search_requires_every_word_by_default(client):
+    engine = deps.indexes["test"]["engine"]
+
+    res = client.get("/api/search?q=jean+dupont", headers=_headers())
+
+    assert res.status_code == 200
+    assert res.json()["match_mode"] == "all"
+    assert res.json()["relaxed"] is False
+    assert engine.calls == [{"query": "jean dupont", "limit": 20, "offset": 0,
+                             "match_all": True, "count": True}]
+
+
+def test_search_falls_back_to_any_word_when_nothing_matches_all(client):
+    engine = RelaxingEngine()
+    deps.indexes["test"]["engine"] = engine
+
+    payload = client.get("/api/search?q=jean+lyon", headers=_headers()).json()
+
+    assert payload["relaxed"] is True
+    assert payload["match_mode"] == "any"
+    assert payload["total"] == 1
+    assert [call["match_all"] for call in engine.calls] == [True, False]
+
+
+def test_search_does_not_relax_when_mode_is_forced(client):
+    engine = RelaxingEngine()
+    deps.indexes["test"]["engine"] = engine
+
+    payload = client.get("/api/search?q=jean+lyon&match=all", headers=_headers()).json()
+
+    assert payload["relaxed"] is False
+    assert payload["total"] == 0
+    assert [call["match_all"] for call in engine.calls] == [True]
+
+
+def test_search_does_not_relax_on_later_pages(client):
+    engine = RelaxingEngine()
+    deps.indexes["test"]["engine"] = engine
+
+    client.get("/api/search?q=jean+lyon&offset=20", headers=_headers())
+
+    assert [call["match_all"] for call in engine.calls] == [True]
+
+
+def test_search_match_any_and_invalid_mode(client):
+    engine = deps.indexes["test"]["engine"]
+
+    res = client.get("/api/search?q=jean&match=any", headers=_headers())
+    assert res.json()["match_mode"] == "any"
+    assert engine.calls[-1]["match_all"] is False
+
+    assert client.get("/api/search?q=jean&match=parfois", headers=_headers()).status_code == 422
+
+
+def test_search_count_false_returns_unknown_total(client):
+    deps.indexes["test"]["engine"] = DummyEngine(search_payload={
+        "query": "test", "total": 45, "limit": 20, "offset": 0, "has_more": True,
+        "hits": [_hit("C:/data/co/f.jsonl", "test data")],
+    })
+
+    payload = client.get("/api/search?q=test&offset=20&count=false", headers=_headers()).json()
+
+    assert payload["total"] is None
+    assert payload["total_pages"] is None
+    assert payload["has_more"] is True
+    assert deps.indexes["test"]["engine"].calls[-1]["count"] is False
+
+
+def test_search_highlights_without_accents_on_a_folded_index(client):
+    engine = DummyEngine(search_payload={
+        "query": "helene", "total": 1, "limit": 20, "offset": 0,
+        "hits": [_hit("C:/data/co/f.jsonl", "contact Hélène Martin")],
+    })
+    engine.ascii_folding = True
+    deps.indexes["test"]["engine"] = engine
+
+    snippet = client.get("/api/search?q=helene", headers=_headers()).json()["hits"][0]["snippets"][0]
+
+    start, end = snippet["highlights"][0]
+    assert snippet["text"][start:end] == "Hélène"
+
+
+class FindEngine:
+    """Moteur a deux phases (classement puis lecture), comme engine.SearchEngine."""
+
+    def __init__(self, scored_contents, *, total=None, error=None, delay=0.0, relaxable=False):
+        self.scored = scored_contents
+        self.total = len(scored_contents) if total is None else total
+        self.error = error
+        self.delay = delay
+        self.relaxable = relaxable
+        self.ascii_folding = False
+        self.find_calls = []
+        self.read_calls = []
+
+    def find(self, query, limit=20, offset=0, *, match_all=True, count=True):
+        from engine import HitPage
+
+        self.find_calls.append({"limit": limit, "offset": offset, "match_all": match_all, "count": count})
+        if self.delay:
+            time.sleep(self.delay)
+        if self.error:
+            raise self.error
+        ranked = [(score, i) for i, (score, _content) in enumerate(self.scored)]
+        return HitPage(
+            searcher=self, hits=ranked[offset:offset + limit], total=self.total if count else None,
+            has_more=len(ranked) > offset + limit, relaxable=self.relaxable and match_all,
+        )
+
+    def read_hits(self, searcher, ranked):
+        self.read_calls.append([address for _score, address in ranked])
+        return [_hit(f"C:/data/co/{address}.jsonl", self.scored[address][1], score) for score, address in ranked]
+
+    def search(self, *args, **kwargs):
+        raise AssertionError("le mode tous les index passe par find/read_hits")
+
+
+def _two_indexes(first, second):
+    deps.indexes.clear()
+    for idx_id, name, engine in (("alpha", "Fuite Alpha", first), ("beta", "Fuite Beta", second)):
+        deps.indexes[idx_id] = {"engine": engine, "name": name, "path": "C:/fictif", "source": "",
+                                "status": "ready", "error": ""}
+
+
+def test_search_all_indexes_merges_by_score(client):
+    alpha = FindEngine([(3.0, "alice alpha"), (1.0, "alice alpha bis")])
+    beta = FindEngine([(2.0, "alice beta")])
+    _two_indexes(alpha, beta)
+
+    payload = client.get("/api/search?q=alice&index=all", headers=_headers()).json()
+
+    assert payload["index_id"] == "all"
+    assert payload["total"] == 3
+    assert [(hit["index_name"], hit["score"]) for hit in payload["hits"]] == [
+        ("Fuite Alpha", 3.0), ("Fuite Beta", 2.0), ("Fuite Alpha", 1.0),
+    ]
+    assert payload["partial"] is False
+
+
+def test_search_all_indexes_reads_only_the_page(client):
+    alpha = FindEngine([(10.0 - i, f"alice {i}") for i in range(6)])
+    beta = FindEngine([(9.5 - i, f"alice b{i}") for i in range(6)])
+    _two_indexes(alpha, beta)
+
+    payload = client.get("/api/search?q=alice&index=all&limit=2&offset=2", headers=_headers()).json()
+
+    # Classement fusionne : a0 10, b0 9.5, a1 9, b1 8.5, a2 8...
+    assert [hit["snippets"][0]["text"] for hit in payload["hits"]] == ["alice 1", "alice b1"]
+    assert alpha.find_calls[0]["limit"] == 4 and alpha.find_calls[0]["offset"] == 0
+    assert alpha.read_calls == [[1]] and beta.read_calls == [[1]]
+    assert payload["has_more"] is True
+
+
+def test_search_all_indexes_reports_a_failing_index(client):
+    alpha = FindEngine([(1.0, "alice")])
+    beta = FindEngine([], error=IndexAccessError("disque absent"))
+    _two_indexes(alpha, beta)
+
+    payload = client.get("/api/search?q=alice&index=all", headers=_headers()).json()
+
+    assert payload["partial"] is True
+    assert payload["skipped_indexes"] == [{"id": "beta", "name": "Fuite Beta", "reason": "error"}]
+    assert [hit["index_name"] for hit in payload["hits"]] == ["Fuite Alpha"]
+    assert deps.indexes["beta"]["status"] in {"error", "loading"}
+
+
+def test_search_all_indexes_skips_a_slow_index(client, monkeypatch):
+    import routes.search as route_search
+
+    monkeypatch.setattr(route_search, "ALL_INDEXES_SEARCH_TIMEOUT_SECONDS", 0.2)
+    _two_indexes(FindEngine([(1.0, "alice")]), FindEngine([(2.0, "alice")], delay=1.0))
+
+    payload = client.get("/api/search?q=alice&index=all", headers=_headers()).json()
+
+    assert payload["skipped_indexes"] == [{"id": "beta", "name": "Fuite Beta", "reason": "timeout"}]
+    assert len(payload["hits"]) == 1
+
+
+def test_search_all_indexes_relaxes_globally(client):
+    alpha = FindEngine([], relaxable=True)
+    beta = FindEngine([], relaxable=True)
+    _two_indexes(alpha, beta)
+
+    payload = client.get("/api/search?q=jean+lyon&index=all", headers=_headers()).json()
+
+    assert payload["relaxed"] is True
+    assert [call["match_all"] for call in alpha.find_calls] == [True, False]
+
+
+def test_search_all_indexes_unknown_total_on_later_pages(client):
+    _two_indexes(FindEngine([(1.0, "alice")]), FindEngine([(2.0, "alice")]))
+
+    payload = client.get("/api/search?q=alice&index=all&count=false", headers=_headers()).json()
+
+    assert payload["total"] is None
+    assert payload["total_pages"] is None
+
+
+def test_search_all_indexes_needs_a_ready_index(client):
+    deps.indexes["test"]["status"] = "loading"
+    deps.indexes["test"]["engine"] = None
+
+    res = client.get("/api/search?q=alice&index=all", headers=_headers())
+
+    assert res.status_code == 503
+
+
+def test_search_all_indexes_query_error_is_400(client):
+    _two_indexes(FindEngine([], error=SearchQueryError("syntaxe")), FindEngine([(1.0, "alice")]))
+
+    assert client.get("/api/search?q=alice&index=all", headers=_headers()).status_code == 400

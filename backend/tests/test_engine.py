@@ -298,8 +298,8 @@ def _make_concurrent_engine(tmp_path, reload_duration=0.5):
         num_docs = 10
         num_segments = 2
 
-        def search(self, _parsed, _limit):
-            return type("Result", (), {"hits": [(1.0, "doc1")], "count": 1})()
+        def search(self, _parsed, _limit, count=True):
+            return type("Result", (), {"hits": [(1.0, "doc1")], "count": 1 if count else None})()
 
         def doc(self, _doc_address):
             return type("Doc", (), {
@@ -337,7 +337,7 @@ def _make_concurrent_engine(tmp_path, reload_duration=0.5):
         def searcher(self):
             return ConcurrentSearcher()
 
-        def parse_query(self, query, _fields):
+        def parse_query(self, query, _fields, **_kwargs):
             return query
 
     with patch.object(SearchEngine, "__init__", lambda self, path: None):

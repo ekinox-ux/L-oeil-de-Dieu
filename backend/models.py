@@ -15,18 +15,36 @@ class SearchHit(BaseModel):
     source: str | None = None
     filename: str | None = None
     type: str | None = None
+    # Renseignes pour une recherche sur tous les index.
+    index_id: str | None = None
+    index_name: str | None = None
     snippets: list[Snippet] = Field(default_factory=list)
+
+
+class SkippedSearchIndex(BaseModel):
+    id: str
+    name: str = ""
+    # "error" ou "timeout"
+    reason: str
 
 
 class SearchResponse(BaseModel):
     query: str
-    total: int
+    # None quand le total n'a pas ete recompte (count=false, pages suivantes).
+    total: int | None
     limit: int
     offset: int
     has_more: bool
-    total_pages: int
+    total_pages: int | None
     deduplicated: bool = False
     total_is_raw: bool = False
+    # "all" : chaque mot exige ; "any" : au moins un mot.
+    match_mode: str = "all"
+    # Rien trouve avec tous les mots : resultats contenant au moins un mot.
+    relaxed: bool = False
+    # Tous les index : certains n'ont pas repondu, le total est un minimum.
+    partial: bool = False
+    skipped_indexes: list[SkippedSearchIndex] = Field(default_factory=list)
     index_id: str
     index_name: str = ""
     hits: list[SearchHit] = Field(default_factory=list)

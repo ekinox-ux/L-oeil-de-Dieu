@@ -90,11 +90,24 @@ python analyzer.py <source_dir> [--no-resume]
 
 `SearchEngine` reconstruit l'analyseur de l'indexeur Rust a partir de
 `<index>/.schema_config.toml`, dans le meme ordre de filtres (remove_long,
-lowercase, stemmer, stopword). Les codes de langue de l'indexeur (`fr`, `en`, ...)
+lowercase, stemmer, stopword, ascii_fold si `ascii_folding = true` ; absent,
+l'index garde ses accents). Les codes de langue de l'indexeur (`fr`, `en`, ...)
 sont traduits vers les noms attendus par tantivy-py (`french`, `english`, ...).
 Aucun filtre n'est ignore silencieusement: un analyseur different de celui de
 l'indexation ferait manquer des resultats sans erreur. En cas d'echec, l'index
 passe en erreur avec un message explicite.
+
+## Cache des classements de recherche
+
+`SearchEngine.find()` classe sans lire les documents ; `read_hits()` lit ensuite
+ceux de la page. Le classement (searcher Tantivy, couples score/adresse, total)
+est garde dans un LRU par index (`search_cache.py`). Les adresses ne valent que
+pour le searcher qui les a produites : les documents sont relus avec lui. Apres
+chaque `reload()`, l'empreinte de `meta.json` (date, taille) est comparee : un
+nouveau commit vide le cache, ce qui libere aussi les anciens searchers et
+leurs segments. La recherche sur tous les index (`index=all`) s'appuie sur ce
+decoupage : chaque index classe `offset + limit` documents, seuls ceux de la
+page fusionnee sont lus.
 
 ## Securite HTTP
 

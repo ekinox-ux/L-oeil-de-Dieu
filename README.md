@@ -48,7 +48,9 @@ Le backend est organise en modules:
 - `analyzer.py`: analyse des fichiers JSONL sources (emails, telephones).
 - `snippets.py`: extraction de snippets avec surlignage.
 - `query_terms.py`: decoupage des requetes comme le tokenizer de l'index
-  (repli des requetes refusees par le parseur, regex de surlignage).
+  (repli des requetes refusees par le parseur, variantes des numeros de
+  telephone, regex de surlignage avec ou sans accents).
+- `search_cache.py`: cache memoire des classements de recherche, par index.
 - `settings.py`: configuration centralisee via variables d'environnement.
 
 ### Chargement des index
@@ -119,7 +121,65 @@ Variables utiles:
   ne peut plus tronquer silencieusement les classements a une seule entree.
 
 ## Contrat API de recherche
-`GET /api/search?q=...&limit=20&offset=0&context=2500&index=france`
+`GET /api/search?q=...&limit=20&offset=0&context=2500&index=france&match=auto&count=true`
+
+### Ce qui est cherche
+
+- **Tous les mots sont exiges par defaut** : `jean dupont` ne renvoie que les
+  documents qui contiennent `jean` ET `dupont`. Un `OR` ecrit explicitement
+  reste un OU (`jean OR marie dupont` = (jean OU marie) ET dupont), et `-mot`
+  ou `NOT mot` exclut toujours.
+- **Repli automatique en OU** (`match=auto`, defaut) : si aucun document ne
+  contient tous les mots, la recherche est relancee avec « au moins un mot »
+  et la reponse porte `relaxed=true` (le frontend et le bot l'affichent). Ce
+  repli ne se fait que sur la premiere page et seulement si la requete en OU
+  differe vraiment (un seul mot, ou une requete deja en OU, n'est pas relance).
+  `match=all` ou `match=any` force un mode ; les clients repassent le
+  `match_mode` de la page 1 aux pages suivantes.
+- **Seul le contenu est cherche** : le nom du fichier n'est plus un champ par
+  defaut (toutes les lignes d'une fuite le partagent, un mot qui y figurait
+  faisait correspondre le fichier entier). `filename:mot` filtre toujours sur
+  le nom du fichier ; l'extrait montre alors le debut du document.
+- **Numeros de telephone francais** : un numero, quel que soit son format
+  (`06 12 34 56 78`, `06.12.34.56.78`, `+33 6 12 34 56 78`, `+33 (0)6 ...`,
+  `0033...`, `33612345678`), est cherche sous toutes ses ecritures :
+  `0612345678`, `612345678`, `33612345678`, `0033612345678`, et les phrases
+  `06 12 34 56 78`, `33 6 12 34 56 78`, `33 612345678` (qui couvrent aussi
+  points et tirets). Toutes sont surlignees. Un nombre nu de 9 chiffres n'est
+  pas etendu (c'est aussi le format d'un SIREN). Les decoupages exotiques
+  (`06 1234 5678`) et les indicatifs etrangers ne sont pas couverts.
+- **Accents** : un index construit avec `ascii_folding` (defaut des nouveaux
+  index, voir `.schema_config.toml`) trouve `Hélène` en cherchant `helene` et
+  l'inverse ; le surlignage suit. Un index plus ancien garde ses accents tant
+  qu'il n'est pas reconstruit.
+
+### Total et cache
+
+- `count=false` ne recompte pas le total : `total` et `total_pages` valent
+  alors `null`. Les clients le passent aux pages suivantes, dont ils
+  connaissent deja le total ; compter toutes les correspondances est la partie
+  la plus couteuse d'une recherche sur un mot courant.
+- Chaque index garde en memoire ses derniers classements (scores et adresses
+  des documents, jamais leur contenu) : revenir a une page deja vue ne relance
+  pas Tantivy. Le cache est vide des qu'un nouveau commit est detecte, et
+  borne par `OEIL_SEARCH_CACHE_ENTRIES` (32 recherches par index, `0` le
+  desactive) et `OEIL_SEARCH_CACHE_TTL_SECONDS` (300 s). Les requetes n'y
+  restent qu'en memoire : rien n'est ecrit sur disque ni journalise.
+
+### Tous les index
+
+`index=all` interroge tous les index prets en parallele et fusionne les
+resultats par score. Chaque resultat porte alors `index_id` et `index_name`.
+Les scores BM25 ne sont pas strictement comparables d'un index a l'autre :
+l'ordre entre fuites est approximatif. Un index en erreur ou qui ne repond pas
+en `OEIL_ALL_INDEXES_SEARCH_TIMEOUT_SECONDS` (150 s, sous le timeout de 180 s
+des clients) est ignore : la reponse porte `partial=true` et la liste
+`skipped_indexes` (`id`, `name`, `reason` = `error` ou `timeout`), et le total
+n'est plus qu'un minimum. Une page lointaine coute cher : la page `n` demande
+les `n x limit` premiers resultats de chaque index (ils restent en cache).
+`OEIL_ALL_INDEXES_SEARCH_WORKERS` (8) borne les recherches simultanees.
+
+### Requetes refusees par le parseur
 
 Une requete que le parseur Tantivy refuse (apostrophe comme `O'Brien`, URL
 `http://...` lue comme un champ, adresse IPv6, parenthese seule) n'echoue plus
@@ -142,6 +202,10 @@ Reponse:
   "total_pages": 8,
   "deduplicated": false,
   "total_is_raw": false,
+  "match_mode": "all",
+  "relaxed": false,
+  "partial": false,
+  "skipped_indexes": [],
   "index_id": "france",
   "index_name": "France",
   "hits": [
@@ -160,14 +224,18 @@ Reponse:
 
 | Champ | Type | Description |
 |-------|------|-------------|
-| `total` | int | Nombre total de documents correspondants dans l'index |
+| `total` | int ou null | Nombre total de documents correspondants (`null` avec `count=false`) |
 | `limit` | int | Nombre max de hits demandes par page |
 | `offset` | int | Decalage dans la liste de resultats |
 | `has_more` | bool | `true` s'il reste des resultats apres cette page |
-| `total_pages` | int | Nombre total de pages (`ceil(total / limit)`, minimum 1) |
+| `total_pages` | int ou null | Nombre total de pages (`ceil(total / limit)`, minimum 1 ; `null` avec `count=false`) |
 | `deduplicated` | bool | Indique si la deduplication optionnelle de page a ete appliquee |
 | `total_is_raw` | bool | `true` si `total` compte les hits bruts avant deduplication |
-| `index_id` | str | Identifiant de l'index interroge |
+| `match_mode` | str | `all` (chaque mot exige) ou `any` (au moins un mot) |
+| `relaxed` | bool | `true` si rien ne contenait tous les mots et que la recherche a ete elargie |
+| `partial` | bool | `index=all` : au moins un index a ete ignore, `total` est un minimum |
+| `skipped_indexes` | list | Index ignores (`id`, `name`, `reason`) |
+| `index_id` | str | Identifiant de l'index interroge (`all` pour tous) |
 | `index_name` | str | Nom d'affichage de l'index |
 
 Cas limites:
@@ -220,9 +288,13 @@ Si les deux champs sont absents, les snippets seront vides (`[]`) sans erreur.
   ne surligne pas `martinez`. Les termes exclus (`-mot`, `NOT mot`) ne sont pas
   surlignes. Si une phrase de l'index est coupee par une cle dans le JSON brut,
   ses mots sont surlignes un par un.
-- Quand aucun terme n'apparait dans le contenu brut (correspondance sur le nom
-  de fichier seul), l'extrait est le debut du document, sans surlignage. Une
-  requete faite uniquement d'operateurs ou d'exclusions donne `[]`.
+- Un numero de telephone est surligne sous toutes ses ecritures, jamais par
+  morceaux (`12` surlignerait tous les nombres). Sur un index construit avec
+  `ascii_folding`, `helene` surligne `Hélène`, `strauss` surligne `Strauß`.
+- Quand aucun terme n'apparait dans le contenu brut, ou que la requete ne
+  porte que sur le nom du fichier, la source ou des exclusions, l'extrait est
+  le debut du document, sans surlignage. Une requete faite uniquement
+  d'operateurs donne `[]`.
 
 ## Pagination par canal
 
@@ -230,7 +302,11 @@ Si les deux champs sont absents, les snippets seront vides (`[]`) sans erreur.
 - Pagination **serveur** via `offset`/`limit` dans l'API.
 - 20 resultats par page (`SearchApi.defaultLimit`).
 - Navigation: boutons Precedent/Suivant, desactives selon `has_more` et `offset`.
-- Affiche `total_pages` dans le compteur de resultats.
+- Affiche `total_pages` dans le compteur de resultats. Les pages suivantes
+  reprennent l'index, le `match_mode` et le total de la page 1 (`count=false`).
+- Avec au moins deux index prets, le selecteur propose « Tous les index » :
+  chaque carte indique alors sa fuite d'origine. Un bandeau signale une
+  recherche elargie a « au moins un mot » et les index ignores.
 - Timeouts alignes sur le bot: `180 s` pour la recherche, `45 s` pour les
   fuites, `30 s` ailleurs. Un timeout n'est **jamais** relance automatiquement
   (le backend traite peut-etre encore la requete); seule une erreur reseau sur
@@ -245,6 +321,10 @@ Si les deux champs sont absents, les snippets seront vides (`[]`) sans erreur.
   correspondance, et un long document ne masque plus les suivants.
 - Le parametre `limit` de `/search` fixe le nombre maximal de resultats a
   parcourir (50 au maximum); le footer distingue ce plafond du total brut.
+- `index:all` interroge tous les index ; chaque resultat affiche sa fuite
+  entre crochets, et le footer liste les index ignores.
+- Une recherche elargie a « au moins un mot » le signale en tete de l'embed.
+  Les pages suivantes reprennent le mode et le total de la page 1.
 - Timeout des boutons et vues : 10 minutes (600s), avec desactivation propre a expiration.
 
 ### Limites par canal
@@ -369,8 +449,24 @@ consulter `summary.providers_failed` pour detecter les erreurs.
 ## Fichier .schema_config.toml
 L'indexeur Rust sauvegarde sa configuration dans `<index>/.schema_config.toml`
 lors de la creation de l'index. Le backend Python le relit au demarrage pour
-aligner le tokenizer de recherche (stemming, stop words, langue). Ce fichier
-est gere automatiquement, il ne faut pas le modifier manuellement.
+aligner le tokenizer de recherche (stemming, stop words, langue, accents). Ce
+fichier est gere automatiquement, il ne faut pas le modifier manuellement.
+
+### Accents (`ascii_folding`)
+
+`ascii_folding` retire les accents a l'indexation et a la recherche (`Hélène`
+= `helene`, `Strauß` = `strauss`, `Œuvre` = `oeuvre`). L'option n'a pas a
+etre ecrite dans le `config.toml` de l'indexeur :
+- un nouvel index, ou un index reconstruit avec `--reset`, ignore les accents ;
+- un index existant garde son reglage. Ceux construits avant l'option n'ont
+  pas la cle dans leur `.schema_config.toml` : ils gardent leurs accents, et
+  l'indexation incrementale continue sans conflit ;
+- `ascii_folding = true` ou `false` ecrit explicitement s'impose. Demander un
+  reglage different de celui d'un index existant provoque un conflit de schema
+  qui impose `--reset`, comme pour la langue ou le stemming.
+
+Il faut donc reconstruire un index (`--reset`) pour qu'il ignore les accents.
+Le texte mal encode a l'origine (`HÃ©lÃ¨ne`) n'est pas repare.
 
 L'indexeur conserve aussi `<index>/.source_state.json`. Ce petit fichier lui
 permet de detecter un fichier source modifie et de remplacer ses anciens
@@ -598,3 +694,5 @@ Si une page etait deja ouverte avant une mise a jour, la recharger avec `Ctrl+F5
 ## Limites actuelles
 - `deduplicate=true` deduplique uniquement la page courante et conserve un total brut
 - la vue statistique multi-index additionne les uniques sans deduplication inter-index
+- la recherche sur tous les index ordonne les fuites par score BM25 brut, approximatif d'un index a l'autre
+- les variantes de telephone ne couvrent que les numeros francais
