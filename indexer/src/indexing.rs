@@ -450,21 +450,15 @@ fn validate_reset_target(source_path: &Path, index_path: &Path) -> Result<PathBu
             index_path.display()
         )
     })?;
-    let source = source_path.canonicalize().with_context(|| {
-        format!(
-            "Impossible de resoudre le dossier source : {}",
-            source_path.display()
-        )
-    })?;
 
     if target.parent().is_none() {
         bail!("Reset refuse : une racine de systeme de fichiers ne peut jamais etre supprimee");
     }
-    if source.starts_with(&target) {
+    if source_inside_target(source_path, &target)? {
         bail!(
             "Reset refuse : la cible {} contient le dossier source {}",
             target.display(),
-            source.display()
+            source_path.display()
         );
     }
 
@@ -492,6 +486,47 @@ fn validate_reset_target(source_path: &Path, index_path: &Path) -> Result<PathBu
     }
 
     Ok(target)
+}
+
+/// Vrai si le dossier source est la cible du reset ou s'y trouve.
+///
+/// Certains volumes Windows (disques virtuels, montages WinFsp ou Dokan,
+/// partages) se lisent normalement mais refusent la resolution canonique
+/// (erreur 1005, "le volume ne contient pas de systeme de fichiers connu").
+/// La source est alors comparee par son chemin absolu, sans prefixe `\\?\`
+/// et sans tenir compte de la casse sous Windows. La cible, elle, est toujours
+/// resolue : c'est elle qui est supprimee.
+fn source_inside_target(source_path: &Path, target: &Path) -> Result<bool> {
+    match source_path.canonicalize() {
+        Ok(source) => Ok(source.starts_with(target)),
+        Err(error) => {
+            let source = std::path::absolute(source_path).with_context(|| {
+                format!(
+                    "Impossible de resoudre le dossier source : {}",
+                    source_path.display()
+                )
+            })?;
+            eprintln!(
+                "Avertissement : chemin canonique de la source indisponible ({error}) ; \
+                 verification du reset sur le chemin absolu {}",
+                source.display()
+            );
+            Ok(comparable_path(&source).starts_with(comparable_path(target)))
+        }
+    }
+}
+
+/// Graphie comparable d'un chemin absolu : sans prefixe `\\?\` ni `\\?\UNC\`.
+fn comparable_path(path: &Path) -> PathBuf {
+    let text = path.to_string_lossy();
+    let text = if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{rest}")
+    } else if let Some(rest) = text.strip_prefix(r"\\?\") {
+        rest.to_string()
+    } else {
+        text.into_owned()
+    };
+    PathBuf::from(source_key(&text))
 }
 
 fn is_link_or_reparse_point(metadata: &fs::Metadata) -> bool {
@@ -1791,6 +1826,55 @@ mod tests {
         assert!(error.to_string().contains("contient le dossier source"));
 
         fs::remove_dir_all(target).unwrap();
+    }
+
+    #[test]
+    fn reset_accepts_a_source_that_cannot_be_resolved() {
+        // Une source absente echoue a canonicalize(), comme un volume virtuel
+        // (erreur 1005) : le reset se verifie alors sur le chemin absolu.
+        let root = temp_dir("oeil_reset_unresolved_source");
+        let index = root.join("index");
+        fs::create_dir_all(&index).unwrap();
+        write_tantivy_meta(&index);
+        let source = root.join("volume_virtuel").join("Backup");
+
+        let validated = validate_reset_target(&source, &index).unwrap();
+
+        assert_eq!(validated, index.canonicalize().unwrap());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn reset_still_refuses_an_unresolved_source_inside_the_target() {
+        let target = temp_dir("oeil_reset_unresolved_inside");
+        write_tantivy_meta(&target);
+        let canonical = target.canonicalize().unwrap();
+        // Graphie sans prefixe \\?\, casse differente sous Windows.
+        let plain = comparable_path(&canonical).to_string_lossy().to_uppercase();
+        let source = if cfg!(windows) {
+            PathBuf::from(plain).join("SOURCE_ABSENTE")
+        } else {
+            canonical.join("source_absente")
+        };
+
+        let error = validate_reset_target(&source, &target).unwrap_err();
+
+        assert!(error.to_string().contains("contient le dossier source"));
+        fs::remove_dir_all(target).unwrap();
+    }
+
+    #[test]
+    fn comparable_path_drops_verbatim_prefixes() {
+        if cfg!(windows) {
+            assert_eq!(
+                comparable_path(Path::new(r"\\?\D:\Index")),
+                PathBuf::from(r"d:\index")
+            );
+            assert_eq!(
+                comparable_path(Path::new(r"\\?\UNC\serveur\partage\Index")),
+                PathBuf::from(r"\\serveur\partage\index")
+            );
+        }
     }
 
     #[test]

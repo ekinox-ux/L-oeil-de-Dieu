@@ -564,6 +564,12 @@ disque, un lien symbolique ou une jonction, un dossier arbitraire et tout
 dossier contenant la source. Les anciens index Tantivy sans
 `.schema_config.toml` restent acceptes.
 
+Certains volumes Windows (disques virtuels, montages WinFsp ou Dokan,
+partages) se lisent normalement mais refusent la resolution du chemin canonique
+(erreur 1005). Pour une telle source, le reset compare son chemin absolu a
+celui de l'index, sans tenir compte de la casse, et l'affiche dans un
+avertissement. L'index vise est, lui, toujours resolu et verifie.
+
 ## Statistiques
 
 `GET /api/stats` renvoie deux niveaux de donnees distincts:
